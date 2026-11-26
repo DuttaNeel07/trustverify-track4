@@ -616,16 +616,6 @@ class Authority:
             if public(restored_key) != self.trust["audit_public"]:
                 raise ValueError("backup signing key mismatch")
             with self.locked(), contextlib.closing(sqlite3.connect(":memory:")) as db:
-                if self.path.exists():
-                    try:
-                        with contextlib.closing(connect(self.path)) as live:
-                            self._check_state(live, full=True)
-                            self._sync_tombstones(live)
-                            # Preserve the old committed state if replacement is interrupted before rename.
-                            live.execute("PRAGMA journal_mode=DELETE")
-                    except (sqlite3.Error, ValueError, KeyError, TypeError, InvalidSignature):
-                        # A damaged authority can still be replaced by a verified backup.
-                        pass
                 db.row_factory = sqlite3.Row
                 db.deserialize(unb64(payload["database"]))
                 latest = json.loads((self.operator / "checkpoint.json").read_bytes())
@@ -652,12 +642,22 @@ class Authority:
                     raise ValueError("backup state digest mismatch")
                 if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
                     raise ValueError("backup SQLite integrity failure")
+                self.audit_key = restored_key
+                if self.path.exists():
+                    try:
+                        with contextlib.closing(connect(self.path)) as live:
+                            self._check_state(live, full=True)
+                            self._sync_tombstones(live)
+                            # Preserve the old committed state if replacement is interrupted before rename.
+                            live.execute("PRAGMA journal_mode=DELETE")
+                    except (sqlite3.Error, ValueError, KeyError, TypeError, InvalidSignature):
+                        # A damaged authority can still be replaced by a verified backup.
+                        pass
                 tombstones = self._tombstones()
                 for device, minimum in tombstones["versions"].items():
                     row = db.execute("SELECT version FROM devices WHERE id=?", (device,)).fetchone()
                     if row is None or row["version"] < minimum:
                         raise ValueError("backup predates a committed key rotation; use a newer backup")
-                self.audit_key = restored_key
                 reapplied = []
                 for device in tombstones["devices"]:
                     if db.execute("SELECT 1 FROM devices WHERE id=? AND revoked=0", (device,)).fetchone():

@@ -307,8 +307,9 @@ def test_rollback_cannot_reactivate_a_retired_key(sandbox, tmp_path, legacy):
     if legacy:
         # Older installations have no independently retained rotation floors yet.
         (authority.operator / "revocations.json").unlink()
+    recovery = Authority(authority.directory, authority.operator, recovery_only=True)
     with pytest.raises(ValueError, match="verification failed") as refused:
-        authority.restore(backup, accept_rollback=True)
+        recovery.restore(backup, accept_rollback=True)
     assert "committed key rotation" in str(refused.value.__cause__)
     assert authority.export_log()["checkpoint"] == before
     authority.recover()
