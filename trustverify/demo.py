@@ -221,7 +221,6 @@ def run(directory, fixture_path=None, progress=print):
             expect_denied(lambda: Client(remotes["node-c"], carol, authority.trust).call("access"), "permission")
             checks["live_detection_contained_unapproved_grant"] = True
             performance["live_detection_latency_seconds"] = max(a["detection_latency_seconds"] for a in contained)
-            atomic_write(directory / "audit-export.json", canonical(exported))
             atomic_write(directory / "alerts.json", canonical(detection))
 
             backup = directory / "keys.backup"
@@ -233,6 +232,13 @@ def run(directory, fixture_path=None, progress=print):
             assert authority.restore(backup)["restored"]
             checks["verified_backup_restored"] = True
             authority.recover()
+            # Export last, so the file reaches the operator's retained checkpoint that
+            # `trustverify verify --checkpoint operator/checkpoint.json` checks it against.
+            final = authority.export_log()
+            retained = json.loads((authority.operator / "checkpoint.json").read_bytes())
+            verify_log(final["records"], authority.trust, retained)
+            atomic_write(directory / "audit-export.json", canonical(final))
+            checks["export_verifies_against_retained_checkpoint"] = True
             progress("Both crash boundaries recovered; revocation stayed enforced; corrupted backup rejected; signed logs verified.")
         finally:
             receiver.close()
