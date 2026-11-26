@@ -1,0 +1,15 @@
+{
+  "events": 1162,
+  "benign_events": 1092,
+  "malicious_events": 70,
+  "true_positives": 70,
+  "false_positives": 0,
+  "false_negatives": 0,
+  "precision": 1.0,
+  "recall": 1.0,
+  "f1": 1.0,
+  "median_time_to_alert_seconds": 51.0,
+  "false_alerts_per_1000_benign_events": 0.0,
+  "measurement": "event-level trigger IDs; simulated collector/watermark time; missed attacks counted in recall",
+  "timing_notices": 2
+}

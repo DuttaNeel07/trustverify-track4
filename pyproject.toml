@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trustverify"
+version = "0.1.0"
+description = "Track 4 sandbox: post-quantum transfers, transactional identity lifecycle, verifiable audit and contextual detection"
+requires-python = ">=3.12"
+dependencies = ["cryptography==50.0.2"]
+
+[project.optional-dependencies]
+dev = ["pytest==9.2.0", "reportlab==5.1.2"]
+
+[project.scripts]
+trustverify = "trustverify.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["trustverify*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

@@ -1,0 +1,40 @@
+name: Verify Track 4 prototype
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Install from source
+        run: python -m pip install '.[dev]'
+      - name: Run functional and security regression tests
+        run: python -m pytest -q
+      - name: Run three-process protected workflow
+        run: python -m trustverify demo --directory runtime/ci-demo
+      - name: Verify independently anchored audit log
+        run: >-
+          python -m trustverify verify
+          --log runtime/ci-demo/audit-export.json
+          --trust runtime/ci-demo/operator/trust.json
+          --checkpoint runtime/ci-demo/operator/checkpoint.json
+      - name: Evaluate labelled logs
+        run: python -m trustverify evaluate
+      - name: Verify two-page brief generation
+        run: python scripts/build_brief.py
+      - name: Build container
+        run: docker build --tag trustverify .
+      - name: Run container regression tests
+        run: docker run --rm --network none trustverify python -m pytest -q -p no:cacheprovider
+      - name: Run container protected workflow
+        run: docker run --rm --network none trustverify
