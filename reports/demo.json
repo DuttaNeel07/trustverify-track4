@@ -1,11 +1,12 @@
 {
   "checks": {
     "completed_ephemeral_session_discarded": true,
-    "completed_message_sha256": "d075525b0f3f2017077bed83c0194de4a86dfdbf0fe2fa417ac2e73c56334116",
+    "completed_message_sha256": "6aad930a5549f62790598ac4e8f5e43077d4f8ffd8cccbc2b01ad62afc5bd95d",
     "corrupt_backup_rejected": "backup verification failed; no unverified key material used",
     "crash_preserves_revocation_and_protected_data": true,
     "duplicate_message_rejected": "duplicate completed message",
     "incomplete_delivery_rejected": "delivery failed: incomplete message",
+    "live_detection_contained_unapproved_grant": true,
     "log_injection_keeps_actor_and_boundary": true,
     "loss_and_reordering_recovered": true,
     "owner_reenrollment": true,
@@ -48,19 +49,20 @@
   },
   "performance": {
     "ciphertext_bytes": 99440,
-    "demo_wall_seconds": 1.522535447999985,
-    "endpoint_encrypt_and_sign_ms": 1.261657999975796,
-    "hpke_receive_and_vault_commit_ms": 2.6287760000514027,
+    "demo_wall_seconds": 1.6816604839996216,
+    "endpoint_encrypt_and_sign_ms": 2.2033909999663592,
+    "hpke_receive_and_vault_commit_ms": 3.7349969998103916,
+    "live_detection_latency_seconds": 0.11171722412109375,
     "plaintext_bytes": 98304,
-    "revocation_ack_to_last_observed_rejection_ms": 63.18795999993654,
+    "revocation_ack_to_last_observed_rejection_ms": 80.92021199990995,
     "revocation_ack_to_node_observed_rejection_ms": {
-      "node-a": 13.639771000043766,
-      "node-b": 40.25984400004745,
-      "node-c": 63.18795999993654
+      "node-a": 14.348149999932502,
+      "node-b": 48.800274999848625,
+      "node-c": 80.92021199990995
     },
-    "revocation_commit_roundtrip_ms": 15.760771000032037,
+    "revocation_commit_roundtrip_ms": 16.870327000106045,
     "revocation_measurement": "one harness monotonic clock; sequential probes; observation upper bounds, not replication latency",
-    "revocation_request_to_last_observed_rejection_ms": 78.94873099996857,
+    "revocation_request_to_last_observed_rejection_ms": 97.790539000016,
     "signed_manifest_bytes": 10841
   }
 }

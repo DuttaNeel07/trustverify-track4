@@ -10,6 +10,19 @@ This repository implements three independent HTTP enforcement processes backed b
 
 Clients refuse HTTP redirects so a mock service cannot redirect requests outside its configured endpoint.
 
+## Quick start
+
+| Goal | Commands |
+|---|---|
+| Check the grader adapter (judging runtime: Python 3.12 + pqcrypto only) | `pip install 'pqcrypto==0.4.0'` then `python ../Track-4-Toolkit/validate.py --entry track4_service.py` |
+| Install and test everything | `pip install '.[messaging,dev]'` then `python -m pytest -q` |
+| Run the three-node protected workflow | `python -m trustverify demo --directory runtime/first-demo` |
+| Watch the live log and contain alerts | `python -m trustverify watch --state ... --operator ... --identity ...` (see [Detection and evaluation](#detection-and-evaluation)) |
+| Detector on toolkit practice data | `python -m trustverify practice --toolkit ../Track-4-Toolkit/practice` |
+| Measure adapter overhead | `python scripts/bench_adapter.py --output reports/adapter_bench.json` |
+
+Every section below expands one of these rows.
+
 ## Grader adapter (judging runtime)
 
 [track4_service.py](track4_service.py) is the toolkit's adapter v1 entry point. It reads one JSON request from stdin, writes one JSON reply to stdout and exits. It needs **only Python 3.12 and `pqcrypto==0.4.0`**, the exact offline judging runtime; it never imports `cryptography`. The application logic is in [trustverify/adapter.py](trustverify/adapter.py).
@@ -34,7 +47,7 @@ git clone https://github.com/ScalerOpenSourceLabs/Track-4-Toolkit ../Track-4-Too
 /tmp/judge/bin/python -m pytest -q tests/test_adapter.py tests/test_practice.py
 ```
 
-The adapter is a reduced policy surface (asset ownership, disable and revoke). Rotation, multi-node enforcement, messaging and recovery are demonstrated by the full prototype below.
+The adapter is a reduced policy surface (asset ownership, disable and revoke). **It trusts the caller-supplied `actor`**: adapter v1 passes identities as plain strings from the trusted grader worker, so the identity check is "is this actor the owner, and not disabled or revoked", not authentication of the caller. Likewise `setup` is unauthenticated by contract and replaces all state, including revocations. Authenticated identities (ML-DSA-signed, challenge-bound requests) are in the full prototype. Rotation, multi-node enforcement, messaging and recovery are demonstrated by the full prototype below.
 
 ## Clean-machine setup
 
@@ -200,6 +213,22 @@ The practice data uses its own format, so [trustverify/practice.py](trustverify/
 python -m trustverify practice --toolkit ../Track-4-Toolkit/practice --output reports/practice.json
 python -m trustverify evaluate --input fixtures/heldout_logs.json --output reports/heldout.json
 ```
+
+## Performance and overhead
+
+Adapter, measured as the grader runs it (a fresh process per request, so interpreter start-up is included) with [scripts/bench_adapter.py](scripts/bench_adapter.py) on Python 3.12.3, x86_64. See [reports/adapter_bench.json](reports/adapter_bench.json).
+
+| Operation | Median | p95 |
+|---|---|---|
+| `setup` (1,000 assets) | 50.1 ms | |
+| `read` (500 requests) | 45.4 ms | 62.4 ms |
+| `protected_read` (ML-KEM-768 + HMAC) | 44.1 ms | 62.3 ms |
+| `audit` | 40.4 ms | 52.7 ms |
+| `verify_audit` (551 events, every signature) | 187.1 ms | |
+
+Read latency stays flat as the log grows (first 10%: 45.4 ms, last 10%: 43.9 ms), because each request appends one line to `adapter-audit.jsonl` and rewrites only the small state document. Storage overhead is about 4,850 bytes per audit event, almost all of it the ML-DSA-65 signature.
+
+Full prototype, from [reports/demo.json](reports/demo.json): encrypt and sign a 96 KiB transfer in 2.2 ms (ciphertext 99,440 bytes for 98,304 bytes of plaintext, signed manifest 10,841 bytes); receive, decrypt and commit in 3.7 ms; revocation request to last observed node rejection 98 ms; live detection and containment 0.11 s after the event is logged. The authority rehashes its whole state on every request, which favours verifiability over scale.
 
 ## Objective-to-evidence checklist
 
