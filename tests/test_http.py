@@ -109,3 +109,27 @@ def test_anonymous_client_naming_admin_cannot_evict_its_pending_challenge(sandbo
             with urlopen(remotes["node-a"].url + "/challenge?device=operator-device", timeout=5) as reply:
                 assert reply.status == 200
         assert admin.api.request(pending)["actor"] == "operator"
+
+
+def test_stalled_clients_cannot_block_a_node(sandbox):
+    import socket
+    import time
+    from urllib.parse import urlsplit
+    authority, _, alice, _ = sandbox
+    with nodes(authority) as remotes:
+        target = urlsplit(remotes["node-a"].url)
+        stalled = []
+        for _ in range(8):
+            sock = socket.create_connection((target.hostname, target.port), timeout=5)
+            sock.sendall(b"POST /request HTTP/1.0\r\nContent-Length: 100\r\n")  # never finishes
+            stalled.append(sock)
+        try:
+            started = time.monotonic()
+            assert Client(remotes["node-a"], alice, authority.trust).call("access")["actor"] == "alice"
+            assert time.monotonic() - started < 2
+            with urlopen(remotes["node-a"].url + "/health", timeout=5) as reply:
+                assert "Python" not in reply.headers.get("Server", "")
+                assert reply.headers.get("X-Content-Type-Options") == "nosniff"
+        finally:
+            for sock in stalled:
+                sock.close()
