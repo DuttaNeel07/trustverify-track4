@@ -7,9 +7,12 @@ name = "trustverify"
 version = "0.1.0"
 description = "Track 4 sandbox: post-quantum transfers, transactional identity lifecycle, verifiable audit and contextual detection"
 requires-python = ">=3.12"
-dependencies = ["cryptography==50.0.2"]
+# The grader adapter (track4_service.py) needs only pqcrypto, matching the offline judging runtime.
+dependencies = ["pqcrypto==0.4.0"]
 
 [project.optional-dependencies]
+# Full three-node prototype: hybrid ML-KEM-768/X25519 HPKE messaging, AES-GCM backups.
+messaging = ["cryptography==50.0.2"]
 dev = ["pytest==9.2.0", "reportlab==5.1.2"]
 
 [project.scripts]
@@ -17,6 +20,9 @@ trustverify = "trustverify.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["trustverify*"]
+
+[tool.setuptools.package-data]
+trustverify = ["service_policy.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,11 +1,18 @@
-.PHONY: setup test demo evaluate brief
+TOOLKIT ?= ../Track-4-Toolkit
+.PHONY: setup test test-adapter validate demo evaluate brief practice
 setup:
-	uv sync --extra dev --locked
+	uv sync --extra messaging --extra dev --locked
 test:
-	uv run --extra dev --locked pytest -q
+	uv run --extra messaging --extra dev --locked pytest -q
+test-adapter:
+	uv run --extra dev --locked pytest -q tests/test_adapter.py
+validate:
+	uv run --locked python $(TOOLKIT)/validate.py --entry track4_service.py
 demo:
-	uv run --locked trustverify demo --directory runtime/demo-$$(date +%s)
+	uv run --extra messaging --locked trustverify demo --directory runtime/demo-$$(date +%s)
 evaluate:
-	uv run --locked trustverify evaluate --output reports/detector.json
+	uv run --extra messaging --locked trustverify evaluate --output reports/detector.json
 brief:
-	uv run --extra dev --locked python scripts/build_brief.py
+	uv run --extra messaging --extra dev --locked python scripts/build_brief.py
+practice:
+	uv run --locked python -m trustverify practice --toolkit $(TOOLKIT)/practice --output reports/practice.json

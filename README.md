@@ -10,9 +10,35 @@ This repository implements three independent HTTP enforcement processes backed b
 
 Clients refuse HTTP redirects so a mock service cannot redirect requests outside its configured endpoint.
 
+## Grader adapter (judging runtime)
+
+[track4_service.py](track4_service.py) is the toolkit's adapter v1 entry point. It reads one JSON request from stdin, writes one JSON reply to stdout and exits. It needs **only Python 3.12 and `pqcrypto==0.4.0`**, the exact offline judging runtime; it never imports `cryptography`. The application logic is in [trustverify/adapter.py](trustverify/adapter.py).
+
+| Operation | Behaviour |
+|---|---|
+| `setup` | Stores owners, contents and disabled actors; generates a fresh ML-DSA-65 audit key. `key_material` is never stored, printed or logged. Returns `{"ready":true}`. |
+| `read` | Allows only the asset's owner when not disabled or revoked; returns the exact body. Every other case returns `{"decision":"deny"}` with no content. A reused `request_id` is denied and never overwrites the first record. |
+| `revoke` | Permanently revokes the actor; other actors keep access. |
+| `audit` | Returns the recorded `request_id` and `decision`. |
+| `protected_read` | Same policy, then ML-KEM-768 encapsulation to the supplied raw public key (1184 bytes required) and `proof = HMAC-SHA-256(shared_secret, challenge + body)`. The shared secret never leaves the process. |
+| `verify_audit` | Extra operator check: sequence, hash chain and every ML-DSA-65 signature. |
+
+State lives in `TRACK4_STATE_DIR`, or `<system temp>/trustverify-track4` when unset, and is written atomically (exclusive lock, temp file, fsync, rename) before the reply is printed. [threat-model.json](threat-model.json) declares `protected-resource` / `identity-check`, which is what the adapter enforces.
+
+Check it against the toolkit's validator with only the judging dependencies:
+
+```sh
+python3.12 -m venv /tmp/judge && /tmp/judge/bin/pip install 'pqcrypto==0.4.0' 'pytest==9.2.0'
+git clone https://github.com/ScalerOpenSourceLabs/Track-4-Toolkit ../Track-4-Toolkit
+/tmp/judge/bin/python ../Track-4-Toolkit/validate.py --entry track4_service.py
+/tmp/judge/bin/python -m pytest -q tests/test_adapter.py tests/test_practice.py
+```
+
+The adapter is a reduced policy surface (asset ownership, disable and revoke). Rotation, multi-node enforcement, messaging and recovery are demonstrated by the full prototype below.
+
 ## Clean-machine setup
 
-Requires Linux, Python 3.12 or newer, and Internet access during dependency installation. The crash tests use Linux `fork` and the authority uses POSIX file locking. No database server, PQ library build, API key or account is required. Cryptography wheels include their OpenSSL backend on supported platforms.
+Requires Linux, Python 3.12 or newer, and Internet access during dependency installation. The full prototype uses the optional `messaging` extra (`cryptography`); the grader adapter above does not. The crash tests use Linux `fork` and the authority uses POSIX file locking. No database server, PQ library build, API key or account is required. Cryptography wheels include their OpenSSL backend on supported platforms.
 
 From the repository root:
 
@@ -20,7 +46,7 @@ From the repository root:
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install '.[dev]'
+python -m pip install '.[messaging,dev]'
 python -m pytest -q
 python -m trustverify demo --directory runtime/first-demo
 ```
@@ -30,14 +56,14 @@ The demo directory must be new. Choose another directory for a second run; prior
 Alternatively, with [uv](https://docs.astral.sh/uv/):
 
 ```sh
-uv sync --extra dev --locked
-uv run --extra dev --locked pytest -q
-uv run --locked trustverify demo --directory runtime/first-demo
+uv sync --extra messaging --extra dev --locked
+uv run --extra messaging --extra dev --locked pytest -q
+uv run --extra messaging --locked trustverify demo --directory runtime/first-demo
 ```
 
-Runtime dependency: `cryptography==50.0.2`. Development/document dependencies: `pytest==9.2.0`, `reportlab==5.1.2`. The exact transitive resolution is in [uv.lock](uv.lock). Algorithm and library attribution is in [THIRD_PARTY.md](THIRD_PARTY.md).
+Base dependency: `pqcrypto==0.4.0` (adapter, detector, practice evaluation). `messaging` extra: `cryptography==50.0.2` (HPKE transfers, AES-GCM backups, the three-node prototype). Development/document dependencies: `pytest==9.2.0`, `reportlab==5.1.2`. The exact transitive resolution is in [uv.lock](uv.lock). Algorithm and library attribution is in [THIRD_PARTY.md](THIRD_PARTY.md).
 
-[GitHub Actions verification](https://github.com/jayantkageriofficial/trustverify-track4/actions) installs the project on a fresh Linux runner, runs all tests and the three-process demo, verifies its audit export, regenerates the PDF, and builds/tests/runs the Docker image without external runtime networking. See [.github/workflows/verify.yml](.github/workflows/verify.yml).
+[GitHub Actions verification](https://github.com/jayantkageriofficial/trustverify-track4/actions) has two jobs. `adapter` installs only `pqcrypto` and `pytest`, confirms `cryptography` is absent, and runs the adapter tests, the toolkit validator and the practice-data detector. `verify` installs the project on a fresh Linux runner, runs all tests and the three-process demo, verifies its audit export, regenerates the PDF, and builds/tests/runs the Docker image without external runtime networking. See [.github/workflows/verify.yml](.github/workflows/verify.yml).
 
 ## Run and inspect the evidence
 
@@ -101,7 +127,7 @@ The endpoints hold encryption secrets. Service nodes see encrypted payloads, pub
 - **Encryption:** the library's HPKE `MLKEM768_X25519`/X-Wing hybrid KEM, HKDF-SHA256 and AES-256-GCM. ML-KEM-768 is standardized in FIPS 203; ML-DSA-65 in FIPS 204. The PQ/hybrid HPKE integration is a draft extension; the application protocol is not Signal, Noise, or an independently audited standard.
 - **Recipient binding:** a recipient signs a fresh offer binding the protocol, session ID, both device identities and key versions, and its ephemeral KEM public keys. The sender verifies that offer and signs the ciphertext manifest. The entire binding is HPKE `info`. Changing recipient information fails verification/decryption.
 - **Request authentication:** the authority issues a 30-second, one-use random challenge. ML-DSA authenticates the complete node/action/device/version/challenge/data envelope. Challenges are consumed transactionally; cross-node and duplicate requests fail. A challenge nonce is distinct from a library-managed encryption nonce.
-- **Authorization:** registered ownership, current key state, administrator role and service permission are checked by the authority. Transfer continuation additionally checks both participants' revocation and current service permissions.
+- **Authorization:** registered ownership, current key state, administrator role and service permission are checked by the authority. **Two-person rule:** a privilege grant that cites an approval must be performed by a different administrator than the one who issued it, and no administrator can approve their own access. `init` therefore creates two administrator identities (`operator` and `security-officer`). Transfer continuation additionally checks both participants' revocation and current service permissions.
 - **Forward secrecy:** recipient KEM secrets are created per session, held only in endpoint memory, and dropped after success/failure. They are never backed up. Long-term signing keys alone do not decrypt prior completed sessions. Python does not guarantee physical zeroization of freed memory; process-memory compromise is excluded.
 - **Completed inbox:** plaintext is committed only after full authentication and is encrypted locally under a separate random AES-256 storage key. That storage key is not derived from the identity key and is not sent to the authority.
 
@@ -121,7 +147,7 @@ The final cutoff for **all** old-key use is no later than 120 seconds after rota
 
 Backups contain a consistent SQLite snapshot (public registry, revocations, ciphertext and audit history) plus the audit signing key, encrypted/authenticated with AES-256-GCM under `operator/recovery.key`. The recovery key and signed freshness checkpoint stay outside the authority directory. Private endpoint identity keys and ephemeral secrets are not in this backup.
 
-Restore authenticates the complete backup before using its key material, verifies the pinned signing key, full log chain, current state digest and SQLite integrity, and requires the snapshot to match the latest retained checkpoint exactly. **An older authentic backup is refused**, even if its encryption tag is valid, to prevent revocation rollback. Any later audited request makes the prior snapshot stale. Stop services before taking the recovery snapshot; historical rollback recovery is intentionally unsupported. Backups larger than 64 MiB are outside the sandbox limit.
+Restore authenticates the complete backup before using its key material, verifies the pinned signing key, full log chain, current state digest and SQLite integrity, and requires the snapshot head to match a signed checkpoint. Every checkpoint is also appended to `operator/checkpoints.jsonl`. A backup matching the latest checkpoint restores directly. **An older authentic backup is refused unless the operator passes `--accept-rollback`**, and only if its head matches a retained signed checkpoint; the restore then records the rollback (events lost) as a signed audit event. Revoked devices are copied to signed tombstones in `operator/revocations.json` at every checkpoint and re-applied after any restore, so a rollback never resurrects a revoked device. Stop services before restoring. Backups larger than 64 MiB are outside the sandbox limit.
 
 Every audit record is canonically serialized, individually ML-DSA signed and linked to the preceding record. Its actor comes from verified credentials. User text remains nested in `details`; newlines cannot introduce another event. A separate signed checkpoint exposes deletion of an acknowledged log suffix. Historical public verification does not depend on rotated device keys because the audit key has a separate lifetime.
 
@@ -134,6 +160,9 @@ Rules detect:
 1. Administrator privilege grants without a validated, owner/service-matching, unexpired, single-use approval.
 2. Use of revoked devices or transfer peers.
 3. Observed consecutive service transitions outside the approved `frontend <-> billing` workflow, within 60 seconds and without a recent approved grant for that destination service.
+4. Grants whose approval was issued by the granting administrator (`self_approved_grant`). The authority already rejects these; the rule is defense in depth for imported or legacy logs.
+
+Requests that fail authentication do not each write a signed audit record. They are summarised as one signed `unauthenticated_rejections` event per 100 failures or 60 seconds, and each HTTP node throttles them with a token bucket (burst 20, 10 per second, HTTP 429). Requests that authenticate never draw from that bucket.
 
 Alerts identify the beneficiary identity, acting identity, services, supporting immutable event IDs, rule and explanation. A currently valid credential can still trigger a service-transition alert. Approved administration is context, not a blanket exclusion for all administrators. This is a small workflow-specific detector, not a general UEBA system.
 
@@ -147,7 +176,22 @@ The detector is an offline operator command. End-of-input flush advances the sim
 
 Event-level evaluation counts each trigger event once; supporting context events are not predictions. F1 includes missed attacks. False alerts per 1,000 benign events use the complete benign-event denominator. Median alert latency is computed for detected malicious events from corrected occurrence time to simulated emission; missed events are reported separately.
 
-The checked-in synthetic result is **F1 1.0**, **median 51 seconds**, **0 false alerts per 1,000 benign events**. This deliberately small, rule-aligned fixture does not establish performance on real access logs. See [reports/detector.json](reports/detector.json).
+Three results, reported separately because they measure different things:
+
+| Data | Events (positive) | F1 | Median time to alert | False alerts / 1,000 benign | Report |
+|---|---|---|---|---|---|
+| Rule-aligned synthetic fixture | 1,162 (70) | 1.00 | 51 s | 0 | [reports/detector.json](reports/detector.json) |
+| Held-out synthetic set, written after the rules | 320 (46) | 0.78 | 172 s | 14.6 | [reports/heldout.json](reports/heldout.json) |
+| Toolkit practice data (public, 22 events) | 22 (5) | 1.00 | 0.2 s | 0 | [reports/practice.json](reports/practice.json) |
+
+The rule-aligned fixture was generated alongside the rules, so its 1.0 shows the rules work as designed, not that they generalise. The held-out set ([scripts/make_fixture.py](scripts/make_fixture.py) `make_heldout_events`) uses shuffled neutral identities and includes cases the rules are known to miss: insider access along the approved `frontend -> billing` edge, slow lateral movement beyond the 60-second path window, and first direct use after a self-approved grant (14 misses). Its 4 false alerts are benign uses of an approval after its 300-second window. Its median latency is high because sparse traffic delays the offline watermark; a timer-driven collector would emit after the 30-second lateness bound.
+
+The practice data uses its own format, so [trustverify/practice.py](trustverify/practice.py) applies equivalent rules to it: role changes without a matching approval (subject, role, exclusive validity window, a different approver, and an approval event already received), activity in the same session after such a change, and two or more service edges outside the role policy ([trustverify/service_policy.json](trustverify/service_policy.json)) in one session and flow. A single unexpected edge is a notice, not an alert; denials of scope removed by a recent revocation are expected. It reports out-of-order arrival and corrected clock offsets as notices. **The policy file and these rules were written with the 22 practice events in view**, so the 1.0 there is a functional check, as the toolkit itself says, not an accuracy measurement.
+
+```sh
+python -m trustverify practice --toolkit ../Track-4-Toolkit/practice --output reports/practice.json
+python -m trustverify evaluate --input fixtures/heldout_logs.json --output reports/heldout.json
+```
 
 ## Objective-to-evidence checklist
 
@@ -156,9 +200,9 @@ The checked-in synthetic result is **F1 1.0**, **median 51 seconds**, **0 false 
 | Key rotation | Zero admission grace; all-node rejection; admitted transfer finishes (`test_rotation_cutoff_all_nodes_and_transfer_continuity`) |
 | Revocation / device loss | All-node rejection; measured observation upper bounds; re-enrolment; other user retains access |
 | Crash recovery | Real process termination at both commit boundaries; pinned log/state recovery; revoked key stays revoked |
-| Backup integrity | Bit-flipped backup rejected; fresh restore succeeds; stale restore rejected; missing key/database recovered |
+| Backup integrity | Bit-flipped backup rejected; fresh restore succeeds; older restore needs `--accept-rollback` and re-applies signed revocation tombstones; unknown history rejected; missing key/database recovered |
 | Log integrity | Newline/forged-actor injection, modified actor, deleted record and truncated suffix tests; public verification CLI |
-| Routine / suspicious activity | Trusted approval validation; labelled F1, alert latency and false-alert report |
+| Routine / suspicious activity | Two-person approval enforced by the authority; self-approved grant rule; F1, alert latency and false alerts on rule-aligned, held-out and toolkit practice data |
 | Lateral movement | Valid credentials on unexpected observed service paths; supporting event IDs and rule explanation |
 | Clock differences | ±120 s offset / 30 s lateness; reorder buffer; uncertain-order notices |
 | Replay / recipient binding | Durable completed-message IDs; consumed request challenges; changed recipient and other identity rejected |
@@ -175,7 +219,7 @@ python -m trustverify init --directory runtime/manual
 python -m trustverify serve --state runtime/manual/authority --operator runtime/manual/operator --node node-a --port 8101
 ```
 
-In two other terminals, run the same command with `node-b --port 8102` and `node-c --port 8103`. Stop with Ctrl-C. The init command creates an operator signing identity; no default password exists.
+In two other terminals, run the same command with `node-b --port 8102` and `node-c --port 8103`. Stop with Ctrl-C. The init command creates two administrator signing identities, `operator` and `security-officer`, so grants can carry a second-person approval; no default password exists.
 
 For a signed operator access request:
 
@@ -197,6 +241,7 @@ For offline backup/restore, stop service processes first:
 ```sh
 python -m trustverify backup --state runtime/manual/authority --operator runtime/manual/operator --output runtime/manual/latest.backup
 python -m trustverify restore --state runtime/manual/authority --operator runtime/manual/operator --input runtime/manual/latest.backup
+# For an older verified backup add --accept-rollback; revocations made since are re-applied.
 python -m trustverify recover --state runtime/manual/authority --operator runtime/manual/operator
 ```
 
@@ -216,9 +261,9 @@ The container launches only loopback services and runs as an unprivileged user. 
 
 - Two-page brief: [docs/project-brief.pdf](docs/project-brief.pdf). Page two is the one-page threat model.
 - Five-minute walkthrough script: [DEMO.md](DEMO.md).
-- Public repository/video URLs: [submission.json](submission.json). **The video URL is intentionally blank at the user's request.**
+- Public repository/video URLs: [submission.json](submission.json). **The video URL is not filled in yet; add it before final submission.**
 - Regenerate the PDF: `python scripts/build_brief.py`. Fill the URL fields in `submission.json` when available; populated URLs become clickable PDF links.
 
-Known limits: trusted single-host control plane and OS, loopback HTTP without TLS, central availability dependency, 1 MiB message limit, 120-second admission grants, offline workflow-specific detection, no audit-key rotation, no session resumption, no post-compromise healing and no claim of independently audited or production-secure application protocol. Revocation cannot erase plaintext or keys already copied by a recipient. Whole-state hashing favors auditability over throughput and needs redesign for large stores.
+Known limits: "revocation across nodes" means three HTTP processes reading one shared SQLite authority, so measured revocation times are observation bounds, not replication latency. The two-person rule assumes the two administrator identities belong to different people. The audit signing key sits beside the authority database; the operator-side checkpoint and tombstones are what expose tampering. Trusted single-host control plane and OS, loopback HTTP without TLS, central availability dependency, 1 MiB message limit, 120-second admission grants, offline workflow-specific detection, no audit-key rotation, no session resumption, no post-compromise healing and no claim of independently audited or production-secure application protocol. Revocation cannot erase plaintext or keys already copied by a recipient. Whole-state hashing favors auditability over throughput and needs redesign for large stores.
 
 Publish only source/public evidence, and supply the required public five-minute recording before final submission.

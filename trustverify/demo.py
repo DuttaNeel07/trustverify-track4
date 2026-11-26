@@ -73,19 +73,22 @@ def run(directory, fixture_path=None, progress=print):
     directory = Path(directory).resolve()
     directory.mkdir(parents=True, exist_ok=False, mode=0o700)
     started = time.perf_counter()
-    admin = Identity.generate("operator-device")
+    admin, officer = Identity.generate("operator-device"), Identity.generate("officer-device")
     admin.save(directory / "identities" / "operator")
-    authority = Authority.initialize(directory / "authority", directory / "operator", public(admin.key))
+    officer.save(directory / "identities" / "security-officer")
+    authority = Authority.initialize(directory / "authority", directory / "operator", public(admin.key),
+                                     [("security-officer", officer.device, public(officer.key))])
     alice, bob, carol = (Identity.generate(name + "-device") for name in ("alice", "bob", "carol"))
     checks, performance = {}, {}
     with nodes(authority) as remotes:
         progress("Three loopback service processes running; fresh ML-DSA credentials generated.")
         operator = Client(remotes["node-a"], admin, authority.trust)
+        approver = Client(remotes["node-b"], officer, authority.trust)
         for owner, identity in (("alice", alice), ("bob", bob), ("carol", carol)):
             identity.save(directory / "identities" / owner)
             operator.call("enroll", **identity.enrollment(owner))
             for service in (NODES.values() if owner != "carol" else ["frontend"]):
-                approval = operator.call("approve", owner=owner, service=service)["approval"]
+                approval = approver.call("approve", owner=owner, service=service)["approval"]
                 operator.call("grant", owner=owner, service=service, approval=approval)
         receiver = Receiver(directory / "inbox-bob", bob.device, 1, bob.key)
         try:
@@ -197,6 +200,9 @@ def run(directory, fixture_path=None, progress=print):
             request = current_alice.envelope("access", {})
             current_alice.api.request(request)
             checks["signed_request_replay_rejected"] = expect_denied(lambda: current_alice.api.request(request), "replayed")
+            self_approval = operator.call("approve", owner="carol", service="billing")["approval"]
+            checks["self_approved_grant_rejected"] = expect_denied(
+                lambda: operator.call("grant", owner="carol", service="billing", approval=self_approval), "two-person")
 
             operator.call("grant", owner="carol", service="secrets")
             Client(remotes["node-a"], carol, authority.trust).call("access")

@@ -19,7 +19,7 @@ from .crypto import (atomic_write, b64, canonical, load_private, new_identity,
                      open_backup, private_bytes, public, seal_backup, sign, unb64, verify)
 from .protocol import CHUNK_SIZE, validate_manifest
 
-NODES = {"node-a": "frontend", "node-b": "billing", "node-c": "secrets"}
+from .constants import NODES  # noqa: E402
 ZERO = "0" * 64
 IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
 STATE_TABLES = ("users", "devices", "keys", "permissions", "approvals", "transfers", "chunks")
@@ -28,7 +28,7 @@ CREATE TABLE users (id TEXT PRIMARY KEY, role TEXT NOT NULL CHECK(role IN ('user
 CREATE TABLE devices (id TEXT PRIMARY KEY, owner TEXT NOT NULL REFERENCES users(id), version INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE keys (device TEXT NOT NULL REFERENCES devices(id), version INTEGER NOT NULL, public TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('active','retired','revoked')), PRIMARY KEY(device,version));
 CREATE TABLE permissions (owner TEXT NOT NULL REFERENCES users(id), service TEXT NOT NULL, PRIMARY KEY(owner,service));
-CREATE TABLE approvals (id TEXT PRIMARY KEY, owner TEXT NOT NULL, service TEXT NOT NULL, expires REAL NOT NULL, used INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE approvals (id TEXT PRIMARY KEY, owner TEXT NOT NULL, service TEXT NOT NULL, approved_by TEXT NOT NULL, expires REAL NOT NULL, used INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE nonces (nonce TEXT PRIMARY KEY, node TEXT NOT NULL, expires REAL NOT NULL);
 CREATE TABLE transfers (id TEXT PRIMARY KEY, sender TEXT NOT NULL, sender_version INTEGER NOT NULL, recipient TEXT NOT NULL, recipient_version INTEGER NOT NULL, manifest TEXT NOT NULL, status TEXT NOT NULL, expires REAL NOT NULL);
 CREATE TABLE chunks (transfer_id TEXT NOT NULL REFERENCES transfers(id), idx INTEGER NOT NULL, body BLOB NOT NULL, PRIMARY KEY(transfer_id,idx));
@@ -103,15 +103,28 @@ class Authority:
         if self.audit_key is not None and public(self.audit_key) != self.trust["audit_public"]:
             raise ValueError("audit signing key does not match pinned trust root")
         self.fault, self.now = fault, now
+        # Unauthenticated failures are summarised, not logged one signed record each.
+        self._rejections, self._rejections_since = {}, None
 
     @classmethod
-    def initialize(cls, directory, operator, admin_public):
+    def initialize(cls, directory, operator, admin_public, additional_admins=()):
+        """Bootstrap out of band. ``additional_admins`` is a sequence of (user, device, public).
+
+        Privilege grants need an approval from a different administrator, so a
+        working cluster has at least two administrator identities.
+        """
         directory, operator = Path(directory), Path(operator)
+        admins = [("operator", "operator-device", admin_public)]
+        for user, device, key in additional_admins:
+            admins.append((identifier(user), identifier(device), key))
+        if len({a[0] for a in admins}) != len(admins) or len({a[1] for a in admins}) != len(admins):
+            raise ValueError("administrator users and devices must be distinct")
         if directory.resolve() == operator.resolve() or directory.resolve() in operator.resolve().parents:
             raise ValueError("operator trust/checkpoints must be outside authority directory")
         if directory.exists() or operator.exists():
             raise ValueError("initialization requires new authority and operator directories")
-        mldsa.MLDSA65PublicKey.from_public_bytes(unb64(admin_public))
+        for _, _, key in admins:
+            mldsa.MLDSA65PublicKey.from_public_bytes(unb64(key))
         directory.mkdir(parents=True, mode=0o700)
         operator.mkdir(parents=True, mode=0o700)
         key = new_identity()
@@ -124,17 +137,19 @@ class Authority:
             db.execute("PRAGMA journal_mode=WAL")
             db.execute("PRAGMA synchronous=FULL")
             db.execute("INSERT INTO meta VALUES (?)", (trust["cluster"],))
-            db.execute("INSERT INTO users VALUES ('operator','admin')")
-            db.execute("INSERT INTO devices VALUES ('operator-device','operator',1,0)")
-            db.execute("INSERT INTO keys VALUES ('operator-device',1,?,'active')", (admin_public,))
-            for service in NODES.values():
-                db.execute("INSERT INTO permissions VALUES ('operator',?)", (service,))
+            for user, device, key in admins:
+                db.execute("INSERT INTO users VALUES (?,'admin')", (user,))
+                db.execute("INSERT INTO devices VALUES (?,?,1,0)", (device, user))
+                db.execute("INSERT INTO keys VALUES (?,1,?,'active')", (device, key))
+                for service in NODES.values():
+                    db.execute("INSERT INTO permissions VALUES (?,?)", (user, service))
             db.commit()
         os.chmod(directory / "authority.sqlite", 0o600)
         authority = cls(directory, operator)
         with authority.locked(), contextlib.closing(connect(authority.path)) as db:
             db.execute("BEGIN IMMEDIATE")
-            authority._append(db, "operator", "operator-device", "bootstrap", "authority", "allowed", {})
+            authority._append(db, "operator", "operator-device", "bootstrap", "authority", "allowed",
+                              {"administrators": [a[0] for a in admins]})
             db.commit()
             authority._checkpoint(db)
         return authority
@@ -167,8 +182,48 @@ class Authority:
             if existing["head"] == head:
                 verify(self.trust["audit_public"], "checkpoint", head, existing["signature"])
                 return
-        atomic_write(path, canonical(
-            {"head": head, "signature": sign(self.audit_key, "checkpoint", head)}))
+        self._sync_tombstones(db)
+        checkpoint = {"head": head, "signature": sign(self.audit_key, "checkpoint", head)}
+        atomic_write(path, canonical(checkpoint))
+        # Append-only history lets an older verified backup be restored deliberately.
+        with open(self.operator / "checkpoints.jsonl", "ab") as stream:
+            stream.write(canonical(checkpoint) + b"\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+
+    def _tombstones(self):
+        path = self.operator / "revocations.json"
+        if not path.exists():
+            return []
+        value = json.loads(path.read_bytes())
+        verify(self.trust["audit_public"], "tombstones", value["body"], value["signature"])
+        if value["body"]["cluster"] != self.trust["cluster"]:
+            raise ValueError("tombstone cluster mismatch")
+        return value["body"]["devices"]
+
+    def _sync_tombstones(self, db):
+        """Revoked devices are copied outside the database so no restore can resurrect them."""
+        known = set(self._tombstones())
+        revoked = {row[0] for row in db.execute("SELECT id FROM devices WHERE revoked=1")}
+        if revoked <= known:
+            return
+        body = {"cluster": self.trust["cluster"], "devices": sorted(known | revoked)}
+        atomic_write(self.operator / "revocations.json",
+                     canonical({"body": body, "signature": sign(self.audit_key, "tombstones", body)}))
+
+    def _historical_checkpoints(self):
+        path = self.operator / "checkpoints.jsonl"
+        if not path.exists():
+            return []
+        result = []
+        for line in path.read_bytes().splitlines():
+            try:
+                checkpoint = json.loads(line)
+                verify(self.trust["audit_public"], "checkpoint", checkpoint["head"], checkpoint["signature"])
+            except Exception:  # noqa: BLE001 - a torn or forged line is simply not a usable anchor
+                continue
+            result.append(checkpoint)
+        return result
 
     def _check_state(self, db, *, full=False):
         anchor = json.loads((self.operator / "checkpoint.json").read_bytes())
@@ -202,6 +257,44 @@ class Authority:
                 "observed_at": self.now(), "details": details, "state_digest": state_digest(db)}
         db.execute("INSERT INTO audit VALUES (?,?,?)", (seq, canonical(body).decode("ascii"),
                                                       sign(self.audit_key, "audit", body)))
+
+    REJECTION_BATCH = 100
+    REJECTION_WINDOW_SECONDS = 60
+
+    def pending_rejections(self):
+        return sum(self._rejections.values())
+
+    def _note_rejection(self, reason):
+        if self._rejections_since is None:
+            self._rejections_since = self.now()
+        if reason not in self._rejections and len(self._rejections) >= 32:
+            reason = "other"
+        self._rejections[reason] = self._rejections.get(reason, 0) + 1
+
+    def _rejections_due(self):
+        return self._rejections and (self.pending_rejections() >= self.REJECTION_BATCH or
+                                     self.now() - self._rejections_since >= self.REJECTION_WINDOW_SECONDS)
+
+    def _flush_rejections(self, db, node):
+        """Append one signed summary of unauthenticated failures. Caller holds the lock and a transaction."""
+        details = {"count": self.pending_rejections(), "reasons": dict(sorted(self._rejections.items())),
+                   "first_at": self._rejections_since, "last_at": self.now()}
+        self._append(db, "unauthenticated", None, "unauthenticated_rejections", node, "denied", details)
+        self._rejections, self._rejections_since = {}, None
+
+    def authenticates(self, request):
+        """Cheap pre-check used only for throttling; ``execute`` still makes every decision."""
+        try:
+            with contextlib.closing(connect(self.path)) as db:
+                key = db.execute("SELECT public FROM keys WHERE device=? AND version=?",
+                                 (request["device"], request["version"])).fetchone()
+            if key is None:
+                return False
+            verify(key["public"], "request", {k: v for k, v in request.items() if k != "signature"},
+                   request["signature"])
+            return True
+        except Exception:  # noqa: BLE001 - any failure simply means "not authenticated"
+            return False
 
     def challenge(self, node):
         if node not in NODES:
@@ -270,6 +363,18 @@ class Authority:
                 db.rollback()
                 raise
             try:
+                if failure and authenticated_device is None:
+                    # Nothing was consumed before authentication, so there is no state to commit.
+                    self._note_rejection(str(failure))
+                    db.rollback()
+                    if self._rejections_due():
+                        db.execute("BEGIN IMMEDIATE")
+                        self._flush_rejections(db, node)
+                        db.commit()
+                        self._checkpoint(db)
+                    raise failure
+                if self._rejections_due():
+                    self._flush_rejections(db, node)
                 self._append(db, actor, authenticated_device, request["action"] if isinstance(request["action"], str) else "invalid",
                              node, "denied" if failure else "allowed", details)
                 db.commit()
@@ -345,26 +450,33 @@ class Authority:
             target_service = data["service"]
             if target_service not in NODES.values() or not db.execute("SELECT 1 FROM users WHERE id=?", (owner,)).fetchone():
                 raise ValueError("unknown owner or service")
+            if owner == key["owner"]:
+                raise Denied("two-person rule: administrators cannot approve their own access")
             approval = uuid.uuid4().hex
-            db.execute("INSERT INTO approvals VALUES (?,?,?, ?,0)", (approval, owner, target_service, self.now() + 300))
-            return {"approval": approval}, {"approval": approval, "owner": owner, "target_service": target_service}
+            db.execute("INSERT INTO approvals VALUES (?,?,?,?,?,0)",
+                       (approval, owner, target_service, key["owner"], self.now() + 300))
+            return {"approval": approval}, {"approval": approval, "owner": owner, "target_service": target_service,
+                                            "approved_by": key["owner"]}
         if action in {"grant", "remove_permission"}:
             owner, target_service = identifier(data["owner"]), data["service"]
             if target_service not in NODES.values():
                 raise ValueError("unknown service")
             approval = data.get("approval")
-            approved = False
+            approved, approved_by = False, None
             if approval is not None:
                 row = db.execute("SELECT * FROM approvals WHERE id=?", (approval,)).fetchone()
                 if not row or row["used"] or row["owner"] != owner or row["service"] != target_service or row["expires"] < self.now():
                     raise Denied("invalid approval")
-                approved = True
+                if row["approved_by"] == key["owner"]:
+                    raise Denied("two-person rule: approval must come from a different administrator")
+                approved, approved_by = True, row["approved_by"]
                 db.execute("UPDATE approvals SET used=1 WHERE id=?", (approval,))
             if action == "grant":
                 db.execute("INSERT OR IGNORE INTO permissions VALUES (?,?)", (owner, target_service))
             else:
                 db.execute("DELETE FROM permissions WHERE owner=? AND service=?", (owner, target_service))
-            return {"approved": approved}, {"owner": owner, "target_service": target_service, "approved": approved, "approval": approval}
+            return {"approved": approved}, {"owner": owner, "target_service": target_service, "approved": approved, "approval": approval,
+                                           "approved_by": approved_by}
         self._permission(db, key["owner"], service)
         if action == "access":
             note = data.get("note", "")
@@ -456,8 +568,13 @@ class Authority:
             atomic_write(destination, ciphertext)
             return {"bytes": len(ciphertext), "head": self._head(db)}
 
-    def restore(self, source):
-        """Verify completely in memory before replacing any persistent key or database."""
+    def restore(self, source, accept_rollback=False):
+        """Verify completely in memory before replacing any persistent key or database.
+
+        A backup must match the latest checkpoint, or, with ``accept_rollback``, an earlier
+        signed checkpoint from the operator's history. Revocations recorded after the backup
+        are re-applied from the operator's signed tombstones, so no device comes back.
+        """
         try:
             with Path(source).open("rb") as stream:
                 ciphertext = stream.read(64 * 1024 * 1024 + 1)
@@ -471,12 +588,22 @@ class Authority:
             with self.locked(), contextlib.closing(sqlite3.connect(":memory:")) as db:
                 db.row_factory = sqlite3.Row
                 db.deserialize(unb64(payload["database"]))
-                anchor = json.loads((self.operator / "checkpoint.json").read_bytes())
-                head = verify_log(self._records(db), self.trust, anchor)
+                latest = json.loads((self.operator / "checkpoint.json").read_bytes())
+                records = self._records(db)
+                head = verify_log(records, self.trust)
                 if db.execute("SELECT cluster FROM meta").fetchone()[0] != self.trust["cluster"]:
                     raise ValueError("backup cluster mismatch")
-                if head != anchor["head"]:
-                    raise ValueError("backup is not the latest anchored state")
+                rollback = None
+                if head != latest["head"]:
+                    anchors = [c for c in self._historical_checkpoints() if c["head"] == head]
+                    if not anchors:
+                        raise ValueError("backup head is not a retained signed checkpoint")
+                    verify_log(records, self.trust, anchors[-1])
+                    if not accept_rollback:
+                        raise ValueError(f"backup is older than the latest checkpoint (seq {head['seq']} < "
+                                         f"{latest['head']['seq']}); rerun with accept_rollback to restore it")
+                    rollback = {"from_seq": latest["head"]["seq"], "to_seq": head["seq"],
+                                "events_lost": max(0, latest["head"]["seq"] - head["seq"])}
                 last = json.loads(db.execute("SELECT body FROM audit ORDER BY seq DESC LIMIT 1").fetchone()[0])
                 if state_digest(db) != last["state_digest"]:
                     raise ValueError("backup state digest mismatch")
@@ -489,9 +616,24 @@ class Authority:
                     sidecar = Path(str(self.path) + suffix)
                     if sidecar.exists():
                         sidecar.unlink()
+                tombstones = self._tombstones()
                 atomic_write(self.path, restored)
                 atomic_write(self.directory / "audit.pem", private_bytes(restored_key))
                 self.audit_key = restored_key
-            return {"restored": True, "head": head}
+                reapplied = []
+                with contextlib.closing(connect(self.path)) as live:
+                    live.execute("BEGIN IMMEDIATE")
+                    for device in tombstones:
+                        if live.execute("SELECT 1 FROM devices WHERE id=? AND revoked=0", (device,)).fetchone():
+                            live.execute("UPDATE devices SET revoked=1 WHERE id=?", (device,))
+                            live.execute("UPDATE keys SET state='revoked' WHERE device=?", (device,))
+                            reapplied.append(device)
+                    if rollback or reapplied:
+                        self._append(live, "operator", None, "restore", "authority", "allowed",
+                                     {"rollback": rollback, "reapplied_revocations": reapplied})
+                    live.commit()
+                    self._checkpoint(live)
+                    head = self._head(live)
+            return {"restored": True, "head": head, "rollback": rollback, "reapplied_revocations": reapplied}
         except (InvalidTag, InvalidSignature, ValueError, KeyError, TypeError, sqlite3.Error) as exc:
             raise ValueError("backup verification failed; no unverified key material used") from exc

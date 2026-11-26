@@ -4,7 +4,9 @@ The application implements the integration and lifecycle controls. It does not i
 
 | Dependency / specification | Use / status |
 |---|---|
-| [cryptography](https://github.com/pyca/cryptography), Apache-2.0 OR BSD-3-Clause | Runtime primitives through the bundled OpenSSL backend; see its distribution licenses for bundled components |
+| [pqcrypto](https://pypi.org/project/pqcrypto/) 0.4.0 (PQClean implementations) | Grader adapter: ML-KEM-768 encapsulation for `protected_read`, ML-DSA-65 audit signatures. This is the PQ library the judging runtime provides |
+| [Track 4 Toolkit](https://github.com/ScalerOpenSourceLabs/Track-4-Toolkit) | Adapter v1 contract, `validate.py` and the public practice events used for evaluation. Not vendored; CI clones it |
+| [cryptography](https://github.com/pyca/cryptography), Apache-2.0 OR BSD-3-Clause | `messaging` extra: full-prototype primitives through the bundled OpenSSL backend; see its distribution licenses for bundled components |
 | [cryptography HPKE](https://cryptography.io/en/stable/hazmat/primitives/hpke/) | Library-provided hybrid ML-KEM-768/X25519 KEM, HKDF and AES-GCM |
 | [RFC 9180](https://www.rfc-editor.org/rfc/rfc9180.html) | Base HPKE specification |
 | [Post-quantum HPKE draft](https://datatracker.ietf.org/doc/draft-ietf-hpke-pq/) | PQ/hybrid HPKE integration is a draft extension, not itself a finalized FIPS standard |

@@ -1,65 +1,66 @@
 {
   "checks": {
+    "completed_ephemeral_session_discarded": true,
+    "completed_message_sha256": "d075525b0f3f2017077bed83c0194de4a86dfdbf0fe2fa417ac2e73c56334116",
+    "corrupt_backup_rejected": "backup verification failed; no unverified key material used",
+    "crash_preserves_revocation_and_protected_data": true,
+    "duplicate_message_rejected": "duplicate completed message",
+    "incomplete_delivery_rejected": "delivery failed: incomplete message",
+    "log_injection_keeps_actor_and_boundary": true,
+    "loss_and_reordering_recovered": true,
+    "owner_reenrollment": true,
+    "recipient_tamper_rejected": "recipient offer changed",
+    "revocation_all_nodes_and_other_user_access": true,
+    "rotation_committed_recovery": 2,
     "rotation_old_key_rejected_all_nodes": {
       "node-a": "retired key: new requests require current version",
       "node-b": "retired key: new requests require current version",
       "node-c": "retired key: new requests require current version"
     },
-    "rotation_transfer_continues": true,
-    "loss_and_reordering_recovered": true,
-    "completed_message_sha256": "ded3ef620b2519015aaa81e46291905905574bed3b9bbafcea786d472dcd106a",
-    "duplicate_message_rejected": "duplicate completed message",
-    "completed_ephemeral_session_discarded": true,
-    "recipient_tamper_rejected": "recipient offer changed",
-    "incomplete_delivery_rejected": "delivery failed: incomplete message",
-    "revocation_all_nodes_and_other_user_access": true,
-    "owner_reenrollment": true,
     "rotation_staged_recovery": 1,
-    "rotation_committed_recovery": 2,
-    "crash_preserves_revocation_and_protected_data": true,
-    "log_injection_keeps_actor_and_boundary": true,
+    "rotation_transfer_continues": true,
+    "self_approved_grant_rejected": "two-person rule: approval must come from a different administrator",
     "signed_request_replay_rejected": "expired, replayed or incorrectly bound request",
-    "verified_real_log_detection": true,
-    "corrupt_backup_rejected": "backup verification failed; no unverified key material used",
-    "verified_backup_restored": true
-  },
-  "performance": {
-    "endpoint_encrypt_and_sign_ms": 3.139359998385771,
-    "plaintext_bytes": 98304,
-    "ciphertext_bytes": 99440,
-    "signed_manifest_bytes": 10841,
-    "hpke_receive_and_vault_commit_ms": 1.3130110000929562,
-    "revocation_commit_roundtrip_ms": 11.77428799928748,
-    "revocation_ack_to_node_observed_rejection_ms": {
-      "node-a": 8.455025999865029,
-      "node-b": 24.279278000904014,
-      "node-c": 39.7038999999495
-    },
-    "revocation_ack_to_last_observed_rejection_ms": 39.7038999999495,
-    "revocation_request_to_last_observed_rejection_ms": 51.47818799923698,
-    "revocation_measurement": "one harness monotonic clock; sequential probes; observation upper bounds, not replication latency",
-    "demo_wall_seconds": 0.9823700310007553
-  },
-  "limits": {
-    "new_request_rotation_grace_seconds": 0,
-    "admitted_transfer_grant_seconds": 120,
-    "session_resumption": "unsupported; fresh handshake after interruption",
-    "topology": "three HTTP enforcement processes; one shared transactional SQLite authority",
-    "scope": "loopback, synthetic identities, no production security claim"
+    "verified_backup_restored": true,
+    "verified_real_log_detection": true
   },
   "detector_evaluation": {
-    "events": 1162,
     "benign_events": 1092,
-    "malicious_events": 70,
-    "true_positives": 70,
-    "false_positives": 0,
+    "events": 1162,
+    "f1": 1.0,
+    "false_alerts_per_1000_benign_events": 0.0,
     "false_negatives": 0,
+    "false_positives": 0,
+    "malicious_events": 70,
+    "measurement": "event-level trigger IDs; simulated collector/watermark time; missed attacks counted in recall",
+    "median_time_to_alert_seconds": 51.0,
     "precision": 1.0,
     "recall": 1.0,
-    "f1": 1.0,
-    "median_time_to_alert_seconds": 51.0,
-    "false_alerts_per_1000_benign_events": 0.0,
-    "measurement": "event-level trigger IDs; simulated collector/watermark time; missed attacks counted in recall",
-    "timing_notices": 2
+    "timing_notices": 2,
+    "true_positives": 70
+  },
+  "limits": {
+    "admitted_transfer_grant_seconds": 120,
+    "new_request_rotation_grace_seconds": 0,
+    "scope": "loopback, synthetic identities, no production security claim",
+    "session_resumption": "unsupported; fresh handshake after interruption",
+    "topology": "three HTTP enforcement processes; one shared transactional SQLite authority"
+  },
+  "performance": {
+    "ciphertext_bytes": 99440,
+    "demo_wall_seconds": 1.522535447999985,
+    "endpoint_encrypt_and_sign_ms": 1.261657999975796,
+    "hpke_receive_and_vault_commit_ms": 2.6287760000514027,
+    "plaintext_bytes": 98304,
+    "revocation_ack_to_last_observed_rejection_ms": 63.18795999993654,
+    "revocation_ack_to_node_observed_rejection_ms": {
+      "node-a": 13.639771000043766,
+      "node-b": 40.25984400004745,
+      "node-c": 63.18795999993654
+    },
+    "revocation_commit_roundtrip_ms": 15.760771000032037,
+    "revocation_measurement": "one harness monotonic clock; sequential probes; observation upper bounds, not replication latency",
+    "revocation_request_to_last_observed_rejection_ms": 78.94873099996857,
+    "signed_manifest_bytes": 10841
   }
 }
