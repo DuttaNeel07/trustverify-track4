@@ -296,6 +296,129 @@ def test_backup_from_unknown_history_is_rejected(sandbox, tmp_path):
     assert "retained signed checkpoint" in str(refused.value.__cause__)
 
 
+def test_challenge_flood_cannot_lock_out_enrolled_devices(sandbox):
+    authority, operator, alice, bob = sandbox
+    alice_client = client(authority, alice)
+    pending_alice, pending_admin = alice_client.envelope("access", {}), operator.envelope("access", {})
+    with contextlib.closing(connect(authority.path)) as db:
+        before = db.execute("SELECT COUNT(*) FROM nonces").fetchone()[0]
+    for device in (None, "nobody-device", alice.device, operator.identity.device):
+        for _ in range(32):
+            authority.challenge("node-a", device)
+    with contextlib.closing(connect(authority.path)) as db:
+        assert db.execute("SELECT COUNT(*) FROM nonces").fetchone()[0] == before
+    assert alice_client.api.request(pending_alice)["actor"] == "alice"
+    assert operator.api.request(pending_admin)["actor"] == "operator"
+
+
+def legacy_nonces(authority):
+    with authority.locked(), contextlib.closing(connect(authority.path)) as db, db:
+        db.execute("DROP TABLE nonces")
+        db.execute("CREATE TABLE nonces (nonce TEXT PRIMARY KEY, node TEXT NOT NULL, expires REAL NOT NULL)")
+    (authority.operator / "challenge-epoch").unlink()
+
+
+def test_existing_authority_migrates_without_changing_committed_state(sandbox):
+    authority, _, alice, bob = sandbox
+    legacy_nonces(authority)
+    before = authority.export_log()["checkpoint"]
+    upgraded = Authority(authority.directory, authority.operator)
+    upgraded.recover()
+    assert upgraded.export_log()["checkpoint"] == before
+    for node in NODES:
+        assert client(upgraded, alice, node).call("access")["actor"] == "alice"
+        assert client(upgraded, bob, node).call("access")["actor"] == "bob"
+
+
+def test_legacy_backup_migrates_and_remains_usable(sandbox, tmp_path):
+    authority, _, alice, _ = sandbox
+    legacy_nonces(authority)
+    backup = tmp_path / "legacy.backup"
+    authority.backup(backup)
+    recovery = Authority(authority.directory, authority.operator, recovery_only=True)
+    assert recovery.restore(backup)["restored"]
+    recovery.recover()
+    for node in NODES:
+        assert client(recovery, alice, node).call("access")["actor"] == "alice"
+
+
+def test_stateless_challenge_replay_stays_rejected_after_restart_and_restore(sandbox, tmp_path):
+    authority, _, alice, _ = sandbox
+    alice_client = client(authority, alice)
+    request = alice_client.envelope("access", {})
+    backup = tmp_path / "before-request.backup"
+    authority.backup(backup)
+    alice_client.api.request(request)
+    restarted = Authority(authority.directory, authority.operator)
+    restarted.recover()
+    with pytest.raises(Denied, match="replayed"):
+        restarted.execute("node-a", request)
+    restarted.restore(backup, accept_rollback=True)
+    with pytest.raises(Denied, match="replayed"):
+        restarted.execute("node-a", request)
+    assert client(restarted, alice).call("access")["actor"] == "alice"
+
+
+def test_stateless_challenge_signature_and_expiry_are_enforced(sandbox):
+    from trustverify.crypto import b64, canonical, unb64
+    authority, _, alice, _ = sandbox
+    caller = client(authority, alice)
+    request = caller.envelope("access", {})
+    token = json.loads(unb64(request["nonce"]))
+    token["claim"]["expires"] += 300
+    request["nonce"] = b64(canonical(token))
+    request["signature"] = sign(alice.key, "request", {k: v for k, v in request.items() if k != "signature"})
+    with pytest.raises(Denied, match="expired"):
+        authority.execute("node-a", request)
+    expired = caller.envelope("access", {})
+    authority.now = lambda: time.time() + 31
+    with pytest.raises(Denied, match="expired"):
+        authority.execute("node-a", expired)
+
+
+def test_device_bound_challenge_cannot_be_used_by_another_device(sandbox):
+    authority, _, alice, bob = sandbox
+    nonce = authority.challenge("node-a", alice.device)
+    value = {"node": "node-a", "device": bob.device, "version": bob.version, "nonce": nonce,
+             "action": "access", "data": {}}
+    with pytest.raises(Denied, match="incorrectly bound"):
+        authority.execute("node-a", {**value, "signature": sign(bob.key, "request", value)})
+
+
+def test_directory_lookup_requires_authentication(sandbox):
+    authority, _, alice, bob = sandbox
+    assert client(authority, alice).directory(bob.device)["owner"] == "bob"
+    junk = {"node": "node-a", "device": "nobody", "version": 1, "nonce": "x",
+            "action": "directory", "data": {"device": bob.device}, "signature": "AA=="}
+    with pytest.raises(Denied):
+        authority.execute("node-a", junk)
+
+
+def test_live_watch_detects_and_contains_an_unapproved_grant(sandbox, tmp_path):
+    from trustverify.watch import Watcher
+    authority, operator, _, _ = sandbox
+    carol = Identity.generate("carol-device")
+    operator.call("enroll", **carol.enrollment("carol"))
+    approval = operator.officer.call("approve", owner="carol", service="frontend")["approval"]
+    operator.call("grant", owner="carol", service="frontend", approval=approval)
+    watcher = Watcher(authority, operator.officer, tmp_path / "alerts.jsonl")
+    assert watcher.poll() == []
+    operator.call("grant", owner="carol", service="secrets")
+    assert client(authority, carol, "node-c").call("access")["actor"] == "carol"
+    alerts = watcher.poll()
+    grant = [a for a in alerts if a["rule"] == "unapproved_privilege_grant"]
+    assert grant and grant[0]["identity"] == "carol"
+    assert grant[0]["response"]["status"] == "applied" and grant[0]["detection_latency_seconds"] >= 0
+    with pytest.raises(Denied, match="permission"):
+        client(authority, carol, "node-c").call("access")
+    assert client(authority, carol, "node-a").call("access")["actor"] == "carol"
+    assert watcher.poll() == []  # alerts are not repeated
+    lines = (tmp_path / "alerts.jsonl").read_text().splitlines()
+    assert len(lines) == len(alerts)
+    removal = [r["body"] for r in authority.export_log()["records"] if r["body"]["action"] == "remove_permission"]
+    assert removal[-1]["actor"] == "security-officer"
+
+
 @pytest.mark.parametrize("legacy", [False, True])
 def test_rollback_cannot_reactivate_a_retired_key(sandbox, tmp_path, legacy):
     authority, _, alice, _ = sandbox

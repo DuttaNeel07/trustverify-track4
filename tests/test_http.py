@@ -89,3 +89,23 @@ def test_unauthenticated_flood_is_throttled_without_locking_out_valid_users(sand
             statuses.append(failed.value.status)
         assert 429 in statuses
         assert Client(remotes["node-a"], alice, authority.trust).call("access")["actor"] == "alice"
+
+
+def test_directory_is_not_an_anonymous_http_endpoint(sandbox):
+    authority, _, alice, bob = sandbox
+    with nodes(authority) as remotes:
+        with pytest.raises(HTTPError) as failed:
+            urlopen(remotes["node-a"].url + "/directory/" + bob.device, timeout=5)
+        assert failed.value.code == 404
+        assert Client(remotes["node-a"], alice, authority.trust).directory(bob.device)["owner"] == "bob"
+
+
+def test_anonymous_client_naming_admin_cannot_evict_its_pending_challenge(sandbox):
+    authority, operator, _, _ = sandbox
+    with nodes(authority) as remotes:
+        admin = Client(remotes["node-a"], operator.identity, authority.trust)
+        pending = admin.envelope("access", {})
+        for _ in range(20):
+            with urlopen(remotes["node-a"].url + "/challenge?device=operator-device", timeout=5) as reply:
+                assert reply.status == 200
+        assert admin.api.request(pending)["actor"] == "operator"

@@ -6,19 +6,24 @@ Rules
 - ``unapproved_role_change``: a successful role change with no matching, valid approval
   (same subject and role, inside the exclusive validity window, approved by someone else,
   and approved by an event the collector has already received).
-- ``activity_after_unapproved_role_change``: later allowed activity in the same session
-  within ``REVIEW_WINDOW`` seconds of a flagged role change.
+- ``activity_after_unapproved_role_change``: later allowed activity by the same identity in
+  the same session within ``REVIEW_WINDOW`` seconds of a flagged role change.
 - ``lateral_movement_sequence``: two or more service edges outside the role's policy in the
-  same session and correlation flow within ``SEQUENCE_WINDOW`` seconds. A single unexpected
+  same identity, session and correlation flow within ``SEQUENCE_WINDOW`` seconds. A single unexpected
   edge is reported as a notice, not an alert.
 Timing
 - Corrected event time = source time minus the stated source clock offset.
 - Arrival order is kept as received. An event whose corrected time precedes one already
   received produces an ``out_of_order_arrival`` notice; a nonzero offset produces a
-  ``clock_offset_corrected`` notice; corrected collector delay outside
-  [-``MAX_SKEW``, ``MAX_DELAY``] marks the order as uncertain.
-- Correlation uses corrected event time through a bounded lateness buffer. Unsupported
-  timing or equal timestamps withhold temporal alerts for the affected identity.
+  ``clock_offset_corrected`` notice. The supported range is shared with the main detector
+  (``trustverify.constants``): offsets up to 120 s and corrected delay in [-1 s, 30 s].
+- Correlation uses corrected event time through a ``MAX_LATENESS`` reorder buffer. Timing
+  outside the supported range, or two events of one identity with equal corrected
+  timestamps, flags the order as uncertain and withholds temporal alerts for that identity.
+Baseline
+- An edge is expected if the role policy lists it, or if it has already been observed as
+  allowed for that role by at least ``BASELINE_MIN_IDENTITIES`` distinct identities. Roles
+  missing from the policy therefore start strict and relax only on observed benign use.
 """
 
 import csv
@@ -28,12 +33,11 @@ import statistics
 from datetime import datetime
 from pathlib import Path
 
-from .detector import MAX_CLOCK_OFFSET
+from .constants import MAX_CLOCK_OFFSET, MAX_LATENESS, MAX_NEGATIVE_SKEW
 
 REVIEW_WINDOW = 600
 SEQUENCE_WINDOW = 300
-MAX_DELAY = 30.0
-MAX_SKEW = 1.0
+BASELINE_MIN_IDENTITIES = 2
 POST_REVOCATION_WINDOW = 3600
 POSITIVE_LABELS = {"unexpected_role_change", "review_after_role_change", "lateral_movement_candidate"}
 DEFAULT_POLICY = Path(__file__).resolve().parent / "service_policy.json"
@@ -68,8 +72,9 @@ def load_policy(path=DEFAULT_POLICY):
     return {role: {tuple(edge) for edge in edges} for role, edges in raw["role_edges"].items()}
 
 
-def analyze(events, approvals, policy):
+def analyze(events, approvals, policy, learn=True):
     alerts, notices = [], []
+    learned = {}                # (role, edge) -> identities observed using it successfully
     approved_seen = {}          # approval_id -> approval event
     flagged_sessions = {}       # (actor, session) -> (role-change event, corrected time)
     unexpected = {}             # (actor, session, correlation) -> [events]
@@ -132,7 +137,12 @@ def analyze(events, approvals, policy):
                   [event["source_service"], event["target_service"]], alert_at)
             return
         edge = (event["source_service"], event["target_service"])
-        if edge in policy.get(event["role_before"], set()) or scope_allows(event, at) or denied_after_revocation(event, at):
+        role = event["role_before"]
+        observed = learned.setdefault((role, edge), set())
+        baseline = learn and len(observed) >= BASELINE_MIN_IDENTITIES
+        if success:
+            observed.add(event["actor"])
+        if edge in policy.get(role, set()) or baseline or scope_allows(event, at) or denied_after_revocation(event, at):
             return
         key = (*session, event["correlation_id"])
         group = [e for e in unexpected.get(key, []) if 0 <= at - e["corrected_at"] <= SEQUENCE_WINDOW]
@@ -159,29 +169,34 @@ def analyze(events, approvals, policy):
             notices.append({"event_id": event["event_id"], "notice": "clock_offset_corrected",
                             "offset_seconds": event["offset_seconds"], "corrected_delay_seconds": round(delay, 3)})
         stamp = (event["actor"], at)
-        if (not -MAX_SKEW <= delay <= MAX_DELAY or abs(event["offset_seconds"]) > MAX_CLOCK_OFFSET
-                or stamp in seen_times):
+        if not -MAX_NEGATIVE_SKEW <= delay <= MAX_LATENESS or abs(event["offset_seconds"]) > MAX_CLOCK_OFFSET:
+            reason = "outside supported clock/arrival range"
+        elif stamp in seen_times:
+            reason = "equal corrected timestamps for one identity; order unknown"
+        else:
+            reason = None
+        if reason:
             uncertain.add(event["actor"])
-            notices.append({"event_id": event["event_id"], "notice": "event_order_uncertain",
+            notices.append({"event_id": event["event_id"], "notice": "event_order_uncertain", "reason": reason,
                             "corrected_delay_seconds": round(delay, 3),
-                            "explanation": "unsupported clock/delay or equal identity timestamps; temporal alerts withheld"})
+                            "explanation": "temporal alerts withheld for this identity"})
         seen_times.add(stamp)
         if latest_corrected is not None and at < latest_corrected:
             notices.append({"event_id": event["event_id"], "notice": "out_of_order_arrival",
                             "explanation": "source evidence keeps receipt order; correlation uses corrected event time"})
         latest_corrected = at if latest_corrected is None else max(latest_corrected, at)
         heapq.heappush(queue, (at, position, event))
-        while queue and queue[0][0] <= arrival - MAX_DELAY:
+        while queue and queue[0][0] <= arrival - MAX_LATENESS:
             _, _, ready = heapq.heappop(queue)
             process(ready, arrival)
-    flush_at = latest_arrival + MAX_DELAY
+    flush_at = latest_arrival + MAX_LATENESS
     while queue:
         _, _, ready = heapq.heappop(queue)
         process(ready, flush_at)
     alerts = [a for a in alerts if a["rule"] == "unapproved_role_change" or a["identity"] not in uncertain]
     return {"alerts": alerts, "notices": notices,
-            "timing": {"max_corrected_delay_seconds": MAX_DELAY, "max_negative_skew_seconds": MAX_SKEW,
-                       "max_clock_offset_seconds": MAX_CLOCK_OFFSET, "offline_final_flush_seconds": MAX_DELAY,
+            "timing": {"max_clock_offset_seconds": MAX_CLOCK_OFFSET, "max_corrected_delay_seconds": MAX_LATENESS,
+                       "max_negative_skew_seconds": MAX_NEGATIVE_SKEW, "offline_final_flush_seconds": MAX_LATENESS,
                        "sequence_window_seconds": SEQUENCE_WINDOW, "review_window_seconds": REVIEW_WINDOW}}
 
 
@@ -211,10 +226,13 @@ def score(events, result, labels_path):
             "per_event": rows}
 
 
-def run(directory, policy_path=DEFAULT_POLICY):
+def run(directory, policy_path=DEFAULT_POLICY, use_policy=True):
+    """``use_policy=False`` runs on the learned baseline alone, as for logs from unknown services."""
     directory = Path(directory)
     events = load_events(directory / "events.csv")
-    result = analyze(events, load_approvals(directory / "approvals.json"), load_policy(policy_path))
+    policy = load_policy(policy_path) if use_policy else {}
+    result = analyze(events, load_approvals(directory / "approvals.json"), policy)
+    result["policy"] = "configured + learned baseline" if use_policy else "learned baseline only"
     if (directory / "labels.csv").exists():
         result["evaluation"] = score(events, result, directory / "labels.csv")
     return result

@@ -10,20 +10,33 @@ This repository implements three independent HTTP enforcement processes backed b
 
 Clients refuse HTTP redirects so a mock service cannot redirect requests outside its configured endpoint.
 
+## Quick start
+
+| Goal | Commands |
+|---|---|
+| Check the grader adapter (judging runtime: Python 3.12 + pqcrypto only) | `pip install 'pqcrypto==0.4.0'` then `python ../Track-4-Toolkit/validate.py --entry track4_service.py` |
+| Install and test everything | `pip install '.[messaging,dev]'` then `python -m pytest -q` |
+| Run the three-node protected workflow | `python -m trustverify demo --directory runtime/first-demo` |
+| Watch the live log and contain alerts | `python -m trustverify watch --state ... --operator ... --identity ...` (see [Detection and evaluation](#detection-and-evaluation)) |
+| Detector on toolkit practice data | `python -m trustverify practice --toolkit ../Track-4-Toolkit/practice` |
+| Measure adapter overhead | `python scripts/bench_adapter.py --output reports/adapter_bench.json` |
+
+Every section below expands one of these rows.
+
 ## Grader adapter (judging runtime)
 
 [track4_service.py](track4_service.py) is the toolkit's adapter v1 entry point. It reads one JSON request from stdin, writes one JSON reply to stdout and exits. It needs **only Python 3.12 and `pqcrypto==0.4.0`**, the exact offline judging runtime; it never imports `cryptography`. The application logic is in [trustverify/adapter.py](trustverify/adapter.py).
 
 | Operation | Behaviour |
 |---|---|
-| `setup` | Stores owners, contents and disabled actors; generates a fresh ML-DSA-65 audit key. `key_material` is never stored, printed or logged. Returns `{"ready":true}`. |
-| `read` | Allows only the asset's owner when not disabled or revoked; returns the exact body. Every other case returns `{"decision":"deny"}` with no content. A reused `request_id` is denied and never overwrites the first record. |
+| `setup` | Stores owners, contents and disabled actors; generates a fresh ML-DSA-65 audit key and commits a SHA-256 of every body in the signed setup record. `key_material` is never stored, printed or logged. Returns `{"ready":true,"audit_key_sha256":...}`; the fingerprint is public and is what operators pin. |
+| `read` | Allows only the asset's owner when not disabled or revoked, and only if the stored body still matches its signed SHA-256; returns the exact body. Every other case returns `{"decision":"deny"}` with no content. A reused `request_id` is denied and never overwrites the first record. |
 | `revoke` | Permanently revokes the actor; other actors keep access. |
 | `audit` | Returns the recorded `request_id` and `decision`. |
 | `protected_read` | Same policy, then ML-KEM-768 encapsulation to the supplied raw public key (1184 bytes required) and `proof = HMAC-SHA-256(shared_secret, challenge + body)`. The shared secret never leaves the process. |
-| `verify_audit` | Extra operator check: sequence, hash chain and every ML-DSA-65 signature. |
+| `verify_audit` | Extra operator check: sequence, hash chain and every ML-DSA-65 signature. Pass `audit_key_sha256` (from `setup`) and optionally a `checkpoint` `{"seq","head"}` from an earlier run to detect a log rewritten and re-signed under a substituted key, or truncated. Replies with `anchored: true` only when pinned. |
 
-State lives in `TRACK4_STATE_DIR`, or `<system temp>/trustverify-track4` when unset, and is written atomically (exclusive lock, temp file, fsync, rename) before the reply is printed. [threat-model.json](threat-model.json) declares `protected-resource` / `identity-check`, which is what the adapter enforces.
+State lives in `TRACK4_STATE_DIR`, or `<system temp>/trustverify-track4` when unset, and is written atomically (exclusive lock, temp file, fsync, rename) before the reply is printed. The audit signing key and its public verification key are kept in a separate `keys/` directory (0700). Each load verifies the cached setup signature against that protected public key before trusting any body hash. When upgrading an older adapter state without the public-key file, the service first proves that the cached public key matches the protected private key by signing and verifying a fresh random probe. **At-rest confidentiality of adapter bodies relies on file permissions (0600 files, 0700 directory):** the judging runtime offers no vetted symmetric cipher (pqcrypto has none and `cryptography` is absent), and we do not build one ourselves. Integrity is protected by the verified signed body hashes. The full prototype does encrypt at rest (AES-256-GCM inbox and backups). [threat-model.json](threat-model.json) declares `protected-resource` / `identity-check`, which is what the adapter enforces.
 
 Check it against the toolkit's validator with only the judging dependencies:
 
@@ -34,7 +47,7 @@ git clone https://github.com/ScalerOpenSourceLabs/Track-4-Toolkit ../Track-4-Too
 /tmp/judge/bin/python -m pytest -q tests/test_adapter.py tests/test_practice.py
 ```
 
-The adapter is a reduced policy surface (asset ownership, disable and revoke). Rotation, multi-node enforcement, messaging and recovery are demonstrated by the full prototype below.
+The adapter is a reduced policy surface (asset ownership, disable and revoke). **It trusts the caller-supplied `actor`**: adapter v1 passes identities as plain strings from the trusted grader worker, so the identity check is "is this actor the owner, and not disabled or revoked", not authentication of the caller. Likewise `setup` is unauthenticated by contract and replaces all state, including revocations. Authenticated identities (ML-DSA-signed, challenge-bound requests) are in the full prototype. Rotation, multi-node enforcement, messaging and recovery are demonstrated by the full prototype below.
 
 ## Clean-machine setup
 
@@ -126,7 +139,7 @@ The endpoints hold encryption secrets. Service nodes see encrypted payloads, pub
 - **Identity:** library ML-DSA-65 signatures, with separate application-purpose prefixes for requests, recipient offers, manifests, audit records and checkpoints.
 - **Encryption:** the library's HPKE `MLKEM768_X25519`/X-Wing hybrid KEM, HKDF-SHA256 and AES-256-GCM. ML-KEM-768 is standardized in FIPS 203; ML-DSA-65 in FIPS 204. The PQ/hybrid HPKE integration is a draft extension; the application protocol is not Signal, Noise, or an independently audited standard.
 - **Recipient binding:** a recipient signs a fresh offer binding the protocol, session ID, both device identities and key versions, and its ephemeral KEM public keys. The sender verifies that offer and signs the ciphertext manifest. The entire binding is HPKE `info`. Changing recipient information fails verification/decryption.
-- **Request authentication:** the authority issues a 30-second, one-use random challenge. ML-DSA authenticates the complete node/action/device/version/challenge/data envelope. Challenges are consumed transactionally; cross-node and duplicate requests fail. A challenge nonce is distinct from a library-managed encryption nonce.
+- **Request authentication:** the authority issues a stateless 30-second random challenge signed with the existing library ML-DSA audit key under a separate `challenge` purpose. The token binds the node, optional device, cluster, expiry and current challenge epoch. Issuance allocates no nonce rows and never evicts outstanding tokens, including when an anonymous caller names another device. Only authenticated requests consume tokens; their random IDs are retained transactionally until expiry to reject duplicates, including across node restarts. Restoring a backup changes the separately retained `operator/challenge-epoch` so restoring the replay cache cannot reactivate old requests. Recovery and restore migrate legacy nonce tables; upgrades invalidate older outstanding challenges while preserving committed keys, permissions and data. Directory lookups require an authenticated request. ML-DSA authenticates the complete node/action/device/version/challenge/data envelope. Cross-node and duplicate requests fail. A challenge nonce is distinct from a library-managed encryption nonce.
 - **Authorization:** registered ownership, current key state, administrator role and service permission are checked by the authority. **Two-person rule:** a privilege grant that cites an approval must be performed by a different administrator than the one who issued it, and no administrator can approve their own access. `init` therefore creates two administrator identities (`operator` and `security-officer`). Transfer continuation additionally checks both participants' revocation and current service permissions.
 - **Forward secrecy:** recipient KEM secrets are created per session, held only in endpoint memory, and dropped after success/failure. They are never backed up. Long-term signing keys alone do not decrypt prior completed sessions. Python does not guarantee physical zeroization of freed memory; process-memory compromise is excluded.
 - **Completed inbox:** plaintext is committed only after full authentication and is encrypted locally under a separate random AES-256 storage key. That storage key is not derived from the identity key and is not sent to the authority.
@@ -168,11 +181,18 @@ Requests that fail authentication do not each write a signed audit record. They 
 
 Alerts identify the beneficiary identity, acting identity, services, supporting immutable event IDs, rule and explanation. A currently valid credential can still trigger a service-transition alert. Approved administration is context, not a blanket exclusion for all administrators. This is a small workflow-specific detector, not a general UEBA system.
 
-**Timing bounds:** trusted source offsets up to **±120 seconds**, and corrected event arrival lateness up to **30 seconds**. A watermark buffer orders events within that range. Untrusted offsets, equal ambiguous timestamps and out-of-range events produce timing notices; ambiguous events cannot establish a definite service path. Non-temporal revocation/privilege checks still run. Offset estimates must come from a trusted collector, never arbitrary client fields. Authority-native events already use the authority clock.
+**Timing bounds (one range for both detectors, defined in [trustverify/constants.py](trustverify/constants.py)):** trusted source offsets up to **±120 seconds**, corrected event arrival lateness up to **30 seconds**, and at most **1 second** of negative corrected delay. A watermark buffer orders events within that range. Untrusted offsets, equal ambiguous timestamps and out-of-range events produce timing notices; ambiguous events cannot establish a definite service path. Non-temporal revocation/privilege checks still run. Offset estimates must come from a trusted collector, never arbitrary client fields. Authority-native events already use the authority clock.
 
 For an identity with uncertain ordering, path alerts are conservatively withheld for that entire analysis batch. Timing notices list the affected identities; an uncertain permission change also marks its beneficiary. This avoids asserting a path across missing ordering information, at the cost of reduced path coverage for that batch. Other identities and non-temporal rules remain active. Every trusted collector arrival advances the watermark, including arrivals with unsupported source clocks.
 
-The detector is an offline operator command. End-of-input flush advances the simulated collector clock by 30 seconds; it is not a continuously running alert daemon. The reported time-to-alert includes buffering and that flush.
+`evaluate` and `detect` are offline commands; their end-of-input flush advances the simulated collector clock by 30 seconds, and the reported time-to-alert includes buffering and that flush.
+
+**Live detection and response.** `trustverify watch` polls the authority log, verifies it against the pinned trust root and retained checkpoint, runs the same rules, and appends each new alert (with its detection latency) to a JSON-lines file. With a responder administrator identity it contains the alert through an ordinary signed, audited request: an unapproved or self-approved grant has that permission removed, and an unexpected service transition loses access to the destination service. The authority verifies the triggering record hash and checks for later permission changes inside the removal transaction; resolved or re-approved access is skipped. Handled alerts are atomically retained under `operator/watcher-<mode-hash>.json`, separately for alert-only mode and each responder device. Keys use signed-record hashes, so reused sequence numbers after rollback remain distinct. Failed responses are retried on later polls or restart. Run one watcher per responder identity. Revoked-credential use needs no action because the authority already denied it. Responses are audit events, so they can be reviewed and reversed. In the demo, an unapproved grant is detected and contained about 0.1 s after it is logged.
+
+```sh
+python -m trustverify watch --state runtime/manual/authority --operator runtime/manual/operator \
+  --identity runtime/manual/identities/security-officer --output runtime/manual/live-alerts.jsonl
+```
 
 [fixtures/labelled_logs.json](fixtures/labelled_logs.json) has **1,162 labelled events: 1,092 benign and 70 malicious**. It includes approved administration, routine frontend/billing traffic, unapproved grants, valid-credential lateral movement, revoked use, skew and reordered arrival. Labels are never read by detection rules. Tests additionally use two different randomized arrival/offset seeds.
 
@@ -185,15 +205,32 @@ Three results, reported separately because they measure different things:
 | Rule-aligned synthetic fixture | 1,162 (70) | 1.00 | 51 s | 0 | [reports/detector.json](reports/detector.json) |
 | Held-out synthetic set, written after the rules | 320 (46) | 0.78 | 172 s | 14.6 | [reports/heldout.json](reports/heldout.json) |
 | Toolkit practice data (public, 22 events) | 22 (5) | 1.00 | 59.2 s | 0 | [reports/practice.json](reports/practice.json) |
+| Toolkit practice data, learned baseline only (no policy file) | 22 (5) | 0.83 | 59.2 s | 117.6 | [reports/practice-learned.json](reports/practice-learned.json) |
 
 The rule-aligned fixture was generated alongside the rules, so its 1.0 shows the rules work as designed, not that they generalise. The held-out set ([scripts/make_fixture.py](scripts/make_fixture.py) `make_heldout_events`) uses shuffled neutral identities and includes cases the rules are known to miss: insider access along the approved `frontend -> billing` edge, slow lateral movement beyond the 60-second path window, and first direct use after a self-approved grant (14 misses). Its 4 false alerts are benign uses of an approval after its 300-second window. Its median latency is high because sparse traffic delays the offline watermark; a timer-driven collector would emit after the 30-second lateness bound.
 
-The practice data uses its own format, so [trustverify/practice.py](trustverify/practice.py) applies equivalent rules to it: role changes without a matching approval (subject, role, exclusive validity window, a different approver, and an approval event received by the time of the role-change receipt), activity in the same identity/session after such a change, and two or more service edges outside the role policy ([trustverify/service_policy.json](trustverify/service_policy.json)) in one identity/session/flow. A single unexpected edge is a notice, not an alert; denials of scope removed by a recent revocation are expected. Correlation buffers corrected event times for 30 seconds, preserving original receipt evidence. Supported source offsets are ±120 seconds and corrected delay is -1 to 30 seconds; unsupported timing or equal identity timestamps withholds temporal alerts for that identity. Sparse arrivals and the final 30-second flush contribute to the reported 59.2-second median latency. **The policy file and these rules were written with the 22 practice events in view**, so the 1.0 there is a functional check, as the toolkit itself says, not an accuracy measurement.
+The practice data uses its own format, so [trustverify/practice.py](trustverify/practice.py) applies equivalent rules to it: role changes without a matching approval (subject, role, exclusive validity window, a different approver, and an approval event received by the time of the role-change receipt), activity in the same identity/session after such a change, and two or more service edges outside the role policy ([trustverify/service_policy.json](trustverify/service_policy.json)) in one identity/session/flow. A single unexpected edge is a notice, not an alert; denials of scope removed by a recent revocation are expected. An edge also counts as expected once at least two distinct identities with that role have used it successfully, so roles missing from the policy start strict and relax on observed benign use; `--no-policy` runs on that learned baseline alone, as it would on logs from unknown services (2 false alerts on the practice data, both the very first events of the stream). Correlation buffers corrected event times for 30 seconds, preserving original receipt evidence. Supported source offsets are ±120 seconds and corrected delay is -1 to 30 seconds (shared with the main detector in [trustverify/constants.py](trustverify/constants.py)); unsupported timing or equal corrected timestamps for one identity are flagged as order-uncertain and withhold temporal alerts for that identity. Out-of-order arrival and corrected clock offsets are reported as notices. Sparse arrivals and the final 30-second flush contribute to the reported 59.2-second median latency. **The policy file and these rules were written with the 22 practice events in view**, so the 1.0 there is a functional check, as the toolkit itself says, not an accuracy measurement.
 
 ```sh
 python -m trustverify practice --toolkit ../Track-4-Toolkit/practice --output reports/practice.json
 python -m trustverify evaluate --input fixtures/heldout_logs.json --output reports/heldout.json
 ```
+
+## Performance and overhead
+
+Adapter, measured as the grader runs it (a fresh process per request, so interpreter start-up is included) with [scripts/bench_adapter.py](scripts/bench_adapter.py) on Python 3.12.3, x86_64. See [reports/adapter_bench.json](reports/adapter_bench.json).
+
+| Operation | Median | p95 |
+|---|---|---|
+| `setup` (1,000 assets) | 50.1 ms | |
+| `read` (500 requests) | 45.4 ms | 62.4 ms |
+| `protected_read` (ML-KEM-768 + HMAC) | 44.1 ms | 62.3 ms |
+| `audit` | 40.4 ms | 52.7 ms |
+| `verify_audit` (551 events, every signature) | 187.1 ms | |
+
+Read latency stays flat as the log grows (first 10%: 45.4 ms, last 10%: 43.9 ms), because each request appends one line to `adapter-audit.jsonl` and rewrites only the small state document. Storage overhead is about 4,850 bytes per audit event, almost all of it the ML-DSA-65 signature.
+
+Full prototype, from [reports/demo.json](reports/demo.json): encrypt and sign a 96 KiB transfer in 2.2 ms (ciphertext 99,440 bytes for 98,304 bytes of plaintext, signed manifest 10,841 bytes); receive, decrypt and commit in 3.7 ms; revocation request to last observed node rejection 98 ms; live detection and containment 0.11 s after the event is logged. The authority rehashes its whole state on every request, which favours verifiability over scale.
 
 ## Objective-to-evidence checklist
 

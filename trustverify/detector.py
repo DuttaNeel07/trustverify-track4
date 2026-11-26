@@ -4,8 +4,8 @@ import heapq
 import math
 import statistics
 
-MAX_CLOCK_OFFSET = 120
-MAX_LATENESS = 30
+from .constants import MAX_CLOCK_OFFSET, MAX_LATENESS, MAX_NEGATIVE_SKEW
+
 PATH_WINDOW = 60
 APPROVED_EDGES = {("frontend", "billing"), ("billing", "frontend")}
 
@@ -93,7 +93,7 @@ def analyze(events):
         reason = None
         if "source_at" in event and event.get("clock_offset_trusted") is not True:
             reason = "clock offset untrusted; event order uncertain"
-        elif abs(offset) > MAX_CLOCK_OFFSET or not 0 <= arrival - occurred <= MAX_LATENESS:
+        elif abs(offset) > MAX_CLOCK_OFFSET or not -MAX_NEGATIVE_SKEW <= arrival - occurred <= MAX_LATENESS:
             reason = "outside supported clock/arrival range; event order uncertain"
         if reason:
             timing_notice(event, reason)

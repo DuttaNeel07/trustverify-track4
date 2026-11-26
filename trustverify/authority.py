@@ -4,6 +4,7 @@ import contextlib
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
@@ -29,7 +30,7 @@ CREATE TABLE devices (id TEXT PRIMARY KEY, owner TEXT NOT NULL REFERENCES users(
 CREATE TABLE keys (device TEXT NOT NULL REFERENCES devices(id), version INTEGER NOT NULL, public TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('active','retired','revoked')), PRIMARY KEY(device,version));
 CREATE TABLE permissions (owner TEXT NOT NULL REFERENCES users(id), service TEXT NOT NULL, PRIMARY KEY(owner,service));
 CREATE TABLE approvals (id TEXT PRIMARY KEY, owner TEXT NOT NULL, service TEXT NOT NULL, approved_by TEXT NOT NULL, expires REAL NOT NULL, used INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE nonces (nonce TEXT PRIMARY KEY, node TEXT NOT NULL, expires REAL NOT NULL);
+CREATE TABLE nonces (nonce TEXT PRIMARY KEY, node TEXT NOT NULL, device TEXT, issued REAL NOT NULL, expires REAL NOT NULL);
 CREATE TABLE transfers (id TEXT PRIMARY KEY, sender TEXT NOT NULL, sender_version INTEGER NOT NULL, recipient TEXT NOT NULL, recipient_version INTEGER NOT NULL, manifest TEXT NOT NULL, status TEXT NOT NULL, expires REAL NOT NULL);
 CREATE TABLE chunks (transfer_id TEXT NOT NULL REFERENCES transfers(id), idx INTEGER NOT NULL, body BLOB NOT NULL, PRIMARY KEY(transfer_id,idx));
 CREATE TABLE audit (seq INTEGER PRIMARY KEY, body TEXT NOT NULL, signature TEXT NOT NULL);
@@ -131,6 +132,7 @@ class Authority:
         trust = {"cluster": uuid.uuid4().hex, "audit_public": public(key)}
         atomic_write(operator / "trust.json", canonical(trust))
         atomic_write(operator / "recovery.key", os.urandom(32))
+        atomic_write(operator / "challenge-epoch", uuid.uuid4().hex.encode("ascii"))
         atomic_write(directory / "audit.pem", private_bytes(key))
         with contextlib.closing(sqlite3.connect(directory / "authority.sqlite")) as db:
             db.executescript(SCHEMA)
@@ -271,6 +273,9 @@ class Authority:
                 if self._head(db) == target["head"]:
                     anchor = target
             head = self._check_state(db, full=True, anchor=anchor)
+            self._migrate_nonces(db)
+            if not (self.operator / "challenge-epoch").exists():
+                atomic_write(self.operator / "challenge-epoch", uuid.uuid4().hex.encode("ascii"))
             # A committed, valid tail may precede its checkpoint if the process crashed.
             self._checkpoint(db)
             if intent is not None:
@@ -326,20 +331,59 @@ class Authority:
         except Exception:  # noqa: BLE001 - any failure simply means "not authenticated"
             return False
 
-    def challenge(self, node):
+    @staticmethod
+    def _migrate_nonces(db):
+        """Nonces are ephemeral and excluded from the signed state digest. Caller holds the lock."""
+        columns = {row[1] for row in db.execute("PRAGMA table_info(nonces)")}
+        with db:
+            if "device" not in columns:
+                db.execute("ALTER TABLE nonces ADD COLUMN device TEXT")
+            if "issued" not in columns:
+                db.execute("ALTER TABLE nonces ADD COLUMN issued REAL NOT NULL DEFAULT 0")
+            if not {"device", "issued"} <= columns:
+                db.execute("DELETE FROM nonces")
+
+    def challenge(self, node, device=None):
         if node not in NODES:
             raise ValueError("unknown node")
         with self.locked(), contextlib.closing(connect(self.path)) as db:
             self._check_state(db)
-            with db:
-                db.execute("DELETE FROM nonces WHERE expires<?", (self.now(),))
-                if db.execute("SELECT COUNT(*) FROM nonces").fetchone()[0] >= 4096:
-                    raise Denied("challenge capacity reached", 429)
-                nonce = uuid.uuid4().hex + uuid.uuid4().hex
-                db.execute("INSERT INTO nonces VALUES (?,?,?)", (nonce, node, self.now() + 30))
-            return nonce
+            self._migrate_nonces(db)
+            epoch = self.operator / "challenge-epoch"
+            if not epoch.exists():
+                atomic_write(epoch, uuid.uuid4().hex.encode("ascii"))
+            issued = self.now()
+            claim = {"nonce": uuid.uuid4().hex + uuid.uuid4().hex, "node": node,
+                     "device": identifier(device) if device is not None else None,
+                     "issued": issued, "expires": issued + 30,
+                     "epoch": epoch.read_text("ascii"), "cluster": self.trust["cluster"]}
+            # Issuance allocates no database rows and cannot invalidate another client's token.
+            return b64(canonical({"claim": claim, "signature": sign(self.audit_key, "challenge", claim)}))
+
+    def _consume_challenge(self, db, token, node, device):
+        try:
+            envelope = json.loads(unb64(token))
+            claim = envelope["claim"]
+            verify(self.trust["audit_public"], "challenge", claim, envelope["signature"])
+            identifier(claim["nonce"])
+            if (claim["node"] != node or claim["device"] not in (None, device)
+                    or claim["cluster"] != self.trust["cluster"]
+                    or claim["epoch"] != (self.operator / "challenge-epoch").read_text("ascii")
+                    or any(type(claim[k]) not in (int, float) or not math.isfinite(claim[k])
+                           for k in ("issued", "expires"))
+                    or not claim["issued"] <= self.now() <= claim["expires"]
+                    or claim["expires"] - claim["issued"] != 30):
+                raise ValueError("challenge binding or expiry mismatch")
+            db.execute("DELETE FROM nonces WHERE expires<?", (self.now(),))
+            if db.execute("SELECT 1 FROM nonces WHERE nonce=?", (claim["nonce"],)).fetchone():
+                raise ValueError("challenge already consumed")
+            db.execute("INSERT INTO nonces(nonce,node,device,issued,expires) VALUES (?,?,?,?,?)",
+                       (claim["nonce"], node, device, claim["issued"], claim["expires"]))
+        except (ValueError, TypeError, KeyError, InvalidSignature, sqlite3.IntegrityError) as exc:
+            raise Denied("expired, replayed or incorrectly bound request") from exc
 
     def directory_entry(self, device):
+        """Operator-side lookup (no HTTP endpoint). Network clients use the authenticated action."""
         identifier(device)
         with self.locked(), contextlib.closing(connect(self.path)) as db:
             self._check_state(db)
@@ -370,10 +414,7 @@ class Authority:
                     raise Denied("unknown credential")
                 verify(key["public"], "request", {k: v for k, v in request.items() if k != "signature"}, request["signature"])
                 actor, authenticated_device = key["owner"], key["device"]
-                nonce = db.execute("SELECT * FROM nonces WHERE nonce=?", (request["nonce"],)).fetchone()
-                if nonce is None or nonce["node"] != node or nonce["expires"] < self.now():
-                    raise Denied("expired, replayed or incorrectly bound request")
-                db.execute("DELETE FROM nonces WHERE nonce=?", (request["nonce"],))
+                self._consume_challenge(db, request["nonce"], node, key["device"])
                 if key["revoked"] or key["state"] == "revoked":
                     raise Denied("revoked device")
                 if key["state"] != "active":
@@ -441,6 +482,14 @@ class Authority:
         service = NODES[node]
         if action in {"enroll", "revoke", "approve", "grant", "remove_permission"} and key["role"] != "admin":
             raise Denied("administrator required")
+        if action == "directory":
+            # Any authenticated device may look up a peer's current key; anonymous callers may not.
+            target = identifier(data["device"])
+            row = db.execute("SELECT d.id,d.owner,d.version,d.revoked,k.public,k.state FROM devices d JOIN keys k ON d.id=k.device AND d.version=k.version WHERE d.id=?", (target,)).fetchone()
+            if row is None:
+                raise Denied("unknown device", 404)
+            value = dict(row)
+            return {"entry": value, "signature": sign(self.audit_key, "directory", value)}, {"target_device": target}
         if action == "enroll":
             owner, device = identifier(data["owner"]), identifier(data["device"])
             proof = {"owner": owner, "device": device, "public": data["public"]}
@@ -491,6 +540,31 @@ class Authority:
             owner, target_service = identifier(data["owner"]), data["service"]
             if target_service not in NODES.values():
                 raise ValueError("unknown service")
+            if action == "remove_permission" and "if_event" in data:
+                trigger = data["if_event"]
+                records = self._records(db)
+                verify_log(records, self.trust, json.loads((self.operator / "checkpoint.json").read_bytes()))
+                seq = trigger.get("seq") if isinstance(trigger, dict) else None
+                if type(seq) is not int or not 0 < seq <= len(records):
+                    raise Denied("containment trigger is no longer present", 409)
+                record = records[seq - 1]
+                if record_hash(record["body"], record["signature"]) != trigger.get("hash"):
+                    raise Denied("containment trigger differs from verified history", 409)
+                event = record["body"]
+                if event["action"] == "grant":
+                    subject, service = event["details"]["owner"], event["details"]["target_service"]
+                elif event["action"] == "access":
+                    subject, service = event["actor"], event["service"]
+                else:
+                    raise Denied("invalid containment trigger", 400)
+                if (subject, service) != (owner, target_service):
+                    raise Denied("containment identity/service mismatch", 400)
+                if any(r["body"]["outcome"] == "allowed" and r["body"]["action"] in {"grant", "remove_permission"}
+                       and (r["body"]["details"].get("owner"), r["body"]["details"].get("target_service"))
+                       == (owner, target_service) for r in records[seq:]):
+                    raise Denied("containment superseded by a later permission change", 409)
+                if not db.execute("SELECT 1 FROM permissions WHERE owner=? AND service=?", (owner, target_service)).fetchone():
+                    raise Denied("containment permission already absent", 409)
             approval = data.get("approval")
             approved, approved_by = False, None
             if approval is not None:
@@ -668,6 +742,7 @@ class Authority:
                     self._append(db, "operator", None, "restore", "authority", "allowed",
                                  {"rollback": rollback, "reapplied_revocations": reapplied})
                 db.commit()
+                self._migrate_nonces(db)
                 # WAL-free output makes atomic database replacement unambiguous.
                 db.execute("PRAGMA journal_mode=DELETE")
                 restored = db.serialize()
@@ -677,6 +752,8 @@ class Authority:
                 atomic_write(self.directory / "audit.pem", private_bytes(restored_key))
                 atomic_write(self.operator / "restore-intent.json", canonical(
                     {"body": body, "signature": sign(restored_key, "restore-intent", body)}))
+                # Restoring replay-cache rows must not make pre-restore requests reusable.
+                atomic_write(self.operator / "challenge-epoch", uuid.uuid4().hex.encode("ascii"))
                 if self.fault:
                     self.fault("restore_prepared")
                 for suffix in ("-wal", "-shm"):

@@ -56,12 +56,23 @@ def parser():
         sub.add_argument("--trust", required=True, help="independently pinned operator/trust.json")
         sub.add_argument("--checkpoint", required=True, help="independently retained operator/checkpoint.json")
         sub.add_argument("--output")
+    live = commands.add_parser("watch", help="live detection over the verified log, with automatic containment")
+    live.add_argument("--state", required=True)
+    live.add_argument("--operator", required=True)
+    live.add_argument("--identity", help="responder administrator identity directory (omit with --no-respond)")
+    live.add_argument("--node", choices=list(NODES), default="node-a")
+    live.add_argument("--interval", type=float, default=1.0)
+    live.add_argument("--once", action="store_true", help="poll once and exit")
+    live.add_argument("--no-respond", action="store_true", help="alert only; take no containment action")
+    live.add_argument("--output", default=None, help="append alerts as JSON lines")
     evaluation = commands.add_parser("evaluate")
     evaluation.add_argument("--input", default="fixtures/labelled_logs.json")
     evaluation.add_argument("--output")
     practice = commands.add_parser("practice", help="run the detector on the toolkit's practice events")
     practice.add_argument("--toolkit", required=True, help="toolkit practice/ directory (events.csv, approvals.json, labels.csv)")
     practice.add_argument("--policy", help="service policy JSON (default: trustverify/service_policy.json)")
+    practice.add_argument("--no-policy", action="store_true",
+                          help="ignore the configured policy and use only the learned baseline")
     practice.add_argument("--output")
     return root
 
@@ -141,9 +152,21 @@ def main(argv=None):
                 result.update(analyze([r["body"] for r in exported["records"]]))
             if args.output:
                 atomic_write(args.output, canonical(result))
+        elif args.command == "watch":
+            from .client import Local
+            from .watch import Watcher
+            authority = Authority(args.state, args.operator)
+            responder = None
+            if not args.no_respond:
+                if not args.identity:
+                    raise ValueError("--identity is required unless --no-respond is given")
+                responder = Client(Local(authority, args.node), Identity.load(args.identity), authority.trust)
+            alerts = Watcher(authority, responder, args.output).run(
+                args.interval, args.once, progress=lambda line: print(line, file=sys.stderr, flush=True))
+            result = {"alerts": len(alerts)}
         elif args.command == "practice":
             from .practice import DEFAULT_POLICY, run
-            result = run(args.toolkit, args.policy or DEFAULT_POLICY)
+            result = run(args.toolkit, args.policy or DEFAULT_POLICY, use_policy=not args.no_policy)
             if args.output:
                 atomic_write(args.output, canonical(result))
         elif args.command == "evaluate":

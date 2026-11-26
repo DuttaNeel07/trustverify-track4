@@ -67,14 +67,12 @@ class Remote:
                     raise Denied("mock service redirect refused", exc.code) from exc
                 raise Denied(json.load(exc).get("error", "request failed"), exc.code) from exc
 
-    def challenge(self):
-        return self._request("/challenge")["nonce"]
+    def challenge(self, device=None):
+        return self._request("/challenge" + ("?device=" + quote(device, safe="") if device else ""))["nonce"]
 
     def request(self, value):
         return self._request("/request", value)
 
-    def directory(self, device):
-        return self._request("/directory/" + quote(device, safe=""))
 
 
 class Local:
@@ -83,14 +81,12 @@ class Local:
     def __init__(self, authority, node="node-a"):
         self.authority, self.node = authority, node
 
-    def challenge(self):
-        return self.authority.challenge(self.node)
+    def challenge(self, device=None):
+        return self.authority.challenge(self.node, device)
 
     def request(self, value):
         return self.authority.execute(self.node, value)
 
-    def directory(self, device):
-        return self.authority.directory_entry(device)
 
 
 class Client:
@@ -99,7 +95,7 @@ class Client:
 
     def envelope(self, action, data):
         value = {"node": self.api.node, "device": self.identity.device,
-                 "version": self.identity.version, "nonce": self.api.challenge(),
+                 "version": self.identity.version, "nonce": self.api.challenge(self.identity.device),
                  "action": action, "data": data}
         return {**value, "signature": sign(self.identity.key, "request", value)}
 
@@ -107,7 +103,8 @@ class Client:
         return self.api.request(self.envelope(action, data))
 
     def directory(self, device):
-        response = self.api.directory(device)
+        # Directory lookups are an authenticated action, so device IDs and owners can't be enumerated.
+        response = self.call("directory", device=device)
         verify(self.trust["audit_public"], "directory", response["entry"], response["signature"])
         entry = response["entry"]
         if entry["id"] != device or entry["revoked"] or entry["state"] != "active":

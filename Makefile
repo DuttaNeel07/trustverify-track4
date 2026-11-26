@@ -1,5 +1,5 @@
 TOOLKIT ?= ../Track-4-Toolkit
-.PHONY: setup test test-adapter validate demo evaluate brief practice
+.PHONY: setup test test-adapter validate demo evaluate brief practice bench
 setup:
 	uv sync --extra messaging --extra dev --locked
 test:
@@ -16,3 +16,5 @@ brief:
 	uv run --extra messaging --extra dev --locked python scripts/build_brief.py
 practice:
 	uv run --locked python -m trustverify practice --toolkit $(TOOLKIT)/practice --output reports/practice.json
+bench:
+	uv run --locked python scripts/bench_adapter.py --output reports/adapter_bench.json

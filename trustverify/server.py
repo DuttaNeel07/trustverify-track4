@@ -5,7 +5,7 @@ import sqlite3
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import unquote
+from urllib.parse import parse_qs, urlsplit
 
 from cryptography.exceptions import InvalidSignature
 
@@ -64,10 +64,10 @@ def serve(directory, operator, node, port):
         def handle_api(self):
             if self.command == "GET" and self.path == "/health":
                 return {"node": node, "service": NODES[node], "status": "running"}
-            if self.command == "GET" and self.path == "/challenge":
-                return {"nonce": authority.challenge(node)}
-            if self.command == "GET" and self.path.startswith("/directory/"):
-                return authority.directory_entry(unquote(self.path[len("/directory/"):]))
+            target = urlsplit(self.path)
+            if self.command == "GET" and target.path == "/challenge":
+                devices = parse_qs(target.query, max_num_fields=1).get("device", [None])
+                return {"nonce": authority.challenge(node, devices[0])}
             if self.command != "POST" or self.path != "/request":
                 raise Denied("unknown endpoint", 404)
             if self.headers.get("Transfer-Encoding"):
