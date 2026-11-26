@@ -103,6 +103,7 @@ class Store:
         self.key_path = self.directory / "keys" / "adapter-audit.key"
         self.public_path = self.key_path.with_suffix(".pub")
         self.mac_path = self.directory / "keys" / "adapter-state.key"
+        self.migration_path = self.directory / "keys" / "adapter-state.migration"
 
     @contextlib.contextmanager
     def locked(self):
@@ -119,17 +120,29 @@ class Store:
             return None
         try:
             state = json.loads(self.path.read_bytes())
-            if not self.mac_path.exists() and "mac" not in state:
-                # Upgrade state written before tagging; the setup-signature checks below still apply.
-                atomic_write(self.mac_path, secrets.token_bytes(32))
-                tag = hmac.new(self.mac_path.read_bytes(), canonical(state), hashlib.sha256).hexdigest()
+            legacy = "mac" not in state
+            tag = state.pop("mac", None)
+            migration = json.loads(self.migration_path.read_bytes()) if self.migration_path.exists() else None
+            if legacy:
+                digest = hashlib.sha256(canonical(state)).hexdigest()
+                if migration is None:
+                    if self.mac_path.exists():
+                        raise ValueError("tag missing from protected state")
+                    key = secrets.token_bytes(32)
+                    migration = {"key": b64(key), "state_sha256": digest}
+                else:
+                    if not hmac.compare_digest(migration["state_sha256"], digest):
+                        raise ValueError("legacy state differs from pending migration")
+                    key = unb64(migration["key"])
+                    if len(key) != 32 or (self.mac_path.exists()
+                                         and not hmac.compare_digest(key, self.mac_path.read_bytes())):
+                        raise ValueError("migration key mismatch")
             else:
-                tag = state.pop("mac")
-            expected = hmac.new(self.mac_path.read_bytes(), canonical(state), hashlib.sha256).hexdigest()
+                expected = hmac.new(self.mac_path.read_bytes(), canonical(state), hashlib.sha256).hexdigest()
+                if not isinstance(tag, str) or not hmac.compare_digest(tag, expected):
+                    raise ValueError("state tag mismatch")
         except (ValueError, KeyError, TypeError, AttributeError, OSError):
             raise RequestError("state unreadable; integrity failure") from None
-        if not isinstance(tag, str) or not hmac.compare_digest(tag, expected):
-            raise RequestError("state tag mismatch; integrity failure")
         if state.get("format") != FORMAT:
             raise RequestError("unsupported state format")
         public_key = unb64(state["audit_public"])
@@ -152,6 +165,20 @@ class Store:
             raise RequestError("audit log shorter than committed state; integrity failure")
         if size > state["audit_bytes"]:
             os.truncate(self.audit_path, state["audit_bytes"])
+        if legacy:
+            verify_audit(self, state)
+            # The protected intent authorizes recovery of this exact state if publication is interrupted.
+            atomic_write(self.migration_path, canonical(migration))
+            if not self.mac_path.exists():
+                atomic_write(self.mac_path, key)
+            self.save(state)
+        if self.migration_path.exists():
+            self.migration_path.unlink()
+            fd = os.open(self.migration_path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
         return state
 
     def save(self, state):
@@ -413,6 +440,31 @@ def error_reply(request, message):
     if op == "revoke":
         return {"revoked": False, "error": message}
     return {"decision": "deny", "error": message}
+
+
+def record_malformed(request, directory=None):
+    """Log sanitized validation failures only against verified existing state and history."""
+    try:
+        store = Store(directory or state_directory())
+        fields = request if isinstance(request, dict) else {}
+        ids = {}
+        for name in ("actor", "asset", "request_id", "op"):
+            value = fields.get(name)
+            ids[name] = value if isinstance(value, str) and IDENTIFIER.fullmatch(value) else None
+        with store.locked():
+            state = store.load()
+            if state is None:
+                return False
+            verify_audit(store, state)
+            seq = _append(store, state, {"op": "invalid_request", "requested_op": ids["op"],
+                                         "actor": ids["actor"], "asset": ids["asset"], "request_id": None,
+                                         "subject_request_id": ids["request_id"],
+                                         "decision": "deny", "reason": "malformed request"})
+            _alert(store, state, "malformed request", seq, ids["actor"], ids["asset"], ids["request_id"])
+            store.save(state)
+        return True
+    except Exception:  # noqa: BLE001 - reporting must never change the fail-closed reply
+        return False
 
 
 def dispatch(request, directory=None):

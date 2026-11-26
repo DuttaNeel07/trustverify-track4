@@ -1,4 +1,5 @@
 Local isolated Linux sandbox: Python 3.12, cryptography 50.0.2, pytest 9.2.0.
-111 passed in 18.96s
-Toolkit practice data included. Three-process demo, toolkit lost-device validator and 20/20 adapter attack probes passed.
-Judging-runtime environment (pqcrypto 0.4.0 + pytest only, cryptography absent): 37 passed in 4.93s
+124 passed in 14.56s
+Toolkit practice data included; all 20 strengthened adapter probes passed.
+Local adapter checks used installed pqcrypto 1.0 with test-only API aliases outside this repository.
+Production remains pinned to pqcrypto 0.4.0; the adapter CI job checks that exact runtime without cryptography.

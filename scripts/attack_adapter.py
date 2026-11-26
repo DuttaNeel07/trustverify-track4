@@ -83,7 +83,11 @@ def run():
                 reply = None
             if code != 0 or not isinstance(reply, dict) or body.encode() in out:
                 bad.append(payload[:40].decode("utf-8", "replace"))
-        probe("malformed requests exit 0 with a JSON object and no content", not bad, "; ".join(bad))
+        _, observed, _ = h.call(op="alerts")
+        malformed_alerts = [a for a in observed.get("alerts", []) if a.get("rule") == "malformed_request"]
+        probe("malformed requests exit 0, disclose no content and raise signed alerts",
+              not bad and len(malformed_alerts) == len(malformed),
+              "; ".join(bad) or f"{len(malformed_alerts)}/{len(malformed)} malformed alerts")
 
         # 2. Identity confusion: only the exact owner string is allowed.
         allowed = read(maya, "brief")[1]

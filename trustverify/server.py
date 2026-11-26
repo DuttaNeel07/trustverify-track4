@@ -58,8 +58,13 @@ def serve(directory, operator, node, port):
 
         def handle(self):
             if not slots.acquire(blocking=False):
+                body = canonical({"error": "node connection capacity reached; retry later"})
+                headers = ("HTTP/1.0 503 Service Unavailable\r\nContent-Type: application/json\r\n"
+                           f"Content-Length: {len(body)}\r\nServer: trustverify-node\r\n"
+                           "Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n"
+                           "Connection: close\r\n\r\n").encode("ascii")
                 with contextlib.suppress(OSError):
-                    self.connection.sendall(b"HTTP/1.0 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n")
+                    self.connection.sendall(headers + body)
                 return
             try:
                 super().handle()

@@ -12,7 +12,7 @@ reply: ``{"decision":"deny","error":...}`` for reads, ``{"ready":false,...}`` fo
 import json
 import sys
 
-from trustverify.adapter import RequestError, dispatch, error_reply
+from trustverify.adapter import RequestError, dispatch, error_reply, record_malformed
 
 MAX_REQUEST_BYTES = 64 * 1024 * 1024
 
@@ -25,12 +25,13 @@ def main():
             raise RequestError("request too large")
         try:
             request = json.loads(raw.decode("utf-8"), parse_constant=_reject_constant)
-        except (UnicodeDecodeError, ValueError):
+        except (UnicodeDecodeError, ValueError, RecursionError):
             raise RequestError("request must be one UTF-8 JSON object") from None
         response = dispatch(request)
     except RequestError as error:
         # RequestError messages are fixed strings that never quote request data.
         print(f"trustverify adapter: {error}", file=sys.stderr)
+        record_malformed(request)
         response = error_reply(request, str(error))
     except Exception as error:  # noqa: BLE001 - never echo details that could hold secrets
         print(f"trustverify adapter: internal error ({type(error).__name__})", file=sys.stderr)

@@ -8,9 +8,9 @@
       "detail": ""
     },
     {
-      "probe": "malformed requests exit 0 with a JSON object and no content",
+      "probe": "malformed requests exit 0, disclose no content and raise signed alerts",
       "held": true,
-      "detail": ""
+      "detail": "20/20 malformed alerts"
     },
     {
       "probe": "owner read allowed",
