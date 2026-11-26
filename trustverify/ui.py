@@ -8,6 +8,7 @@ Optional and separate from the grader path.
 
 import json
 import secrets
+import signal
 import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -131,6 +132,11 @@ def run(port=8765, open_browser=True):
     print(json.dumps({"lab": url, "sandbox": str(lab.base), "stop": "Ctrl+C"}), flush=True)
     if open_browser:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+
+    def stop_on_sigterm(_signum, _frame):
+        raise KeyboardInterrupt  # `kill` takes the same cleanup path as Ctrl+C
+
+    signal.signal(signal.SIGTERM, stop_on_sigterm)
     try:
         server.serve_forever(poll_interval=0.2)
     except KeyboardInterrupt:
