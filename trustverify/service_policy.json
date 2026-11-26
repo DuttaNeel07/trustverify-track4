@@ -1,0 +1,9 @@
+{
+  "description": "Expected service edges (source, target) per role for the toolkit practice scenario. Report-reader access to reports is granted only through a valid approval scope in approvals.json, never here.",
+  "role_edges": {
+    "viewer": [["portal", "identity"], ["portal", "catalog"]],
+    "report-reader": [["portal", "identity"], ["portal", "catalog"]],
+    "operator": [["admin-console", "identity"], ["portal", "identity"]],
+    "service-reader": [["reports", "catalog"]]
+  }
+}

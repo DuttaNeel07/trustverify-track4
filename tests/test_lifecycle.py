@@ -182,7 +182,7 @@ def test_state_tampering_fails_closed(sandbox):
 
 def test_approval_is_scoped_single_use_and_trusted(sandbox):
     authority, operator, _, _ = sandbox
-    approval = operator.call("approve", owner="alice", service="secrets")["approval"]
+    approval = operator.officer.call("approve", owner="alice", service="secrets")["approval"]
     with pytest.raises(Denied, match="approval"):
         operator.call("grant", owner="bob", service="secrets", approval=approval)
     assert operator.call("grant", owner="alice", service="secrets", approval=approval)["approved"]
@@ -226,3 +226,149 @@ def test_key_reuse_cannot_bypass_rotation_or_device_revocation(sandbox):
     operator.call("revoke", device=alice.device)
     with pytest.raises(Denied, match="fresh device key"):
         operator.call("enroll", **Identity("alice-replacement", alice.key).enrollment("alice"))
+
+
+def test_two_person_rule_blocks_self_approved_grants(sandbox):
+    authority, operator, _, _ = sandbox
+    own = operator.call("approve", owner="alice", service="secrets")["approval"]
+    with pytest.raises(Denied, match="two-person"):
+        operator.call("grant", owner="alice", service="secrets", approval=own)
+    with pytest.raises(Denied, match="two-person"):
+        operator.officer.call("approve", owner="security-officer", service="billing")
+    records = authority.export_log()["records"]
+    denied = [r["body"] for r in records if r["body"]["action"] == "grant" and r["body"]["outcome"] == "denied"]
+    assert denied and "two-person" in denied[-1]["details"]["reason"]
+    # The same approval still works when the other administrator performs the grant.
+    result = operator.officer.call("grant", owner="alice", service="secrets", approval=own)
+    assert result["approved"] is True
+    grant = authority.export_log()["records"][-1]["body"]
+    assert grant["details"]["approved_by"] == "operator" and grant["actor"] == "security-officer"
+
+
+def test_unauthenticated_requests_do_not_flood_signed_log(sandbox):
+    authority, _, alice, _ = sandbox
+    before = len(authority.export_log()["records"])
+    junk = {"node": "node-a", "device": "nobody", "version": 1, "nonce": "x",
+            "action": "access", "data": {}, "signature": "AA=="}
+    for _ in range(250):
+        with pytest.raises(Denied):
+            authority.execute("node-a", dict(junk))
+    records = authority.export_log()["records"]
+    summaries = [r["body"] for r in records[before:] if r["body"]["action"] == "unauthenticated_rejections"]
+    assert len(records) - before == len(summaries) <= 3
+    assert sum(s["details"]["count"] for s in summaries) + authority.pending_rejections() == 250
+    assert client(authority, alice).call("access")["actor"] == "alice"
+    exported = authority.export_log()
+    verify_log(exported["records"], authority.trust, exported["checkpoint"])
+
+
+def test_older_backup_restores_only_with_explicit_rollback_and_keeps_revocations(sandbox, tmp_path):
+    authority, operator, alice, bob = sandbox
+    backup = tmp_path / "older.backup"
+    authority.backup(backup)
+    client(authority, bob).call("access", note="after backup")
+    operator.call("revoke", device=alice.device)
+    with pytest.raises(ValueError, match="verification failed") as refused:
+        authority.restore(backup)
+    assert "accept_rollback" in str(refused.value.__cause__)
+    result = authority.restore(backup, accept_rollback=True)
+    assert result["rollback"]["to_seq"] < result["rollback"]["from_seq"]
+    assert result["reapplied_revocations"] == [alice.device]
+    authority.recover()
+    for node in NODES:
+        with pytest.raises(Denied, match="revoked"):
+            client(authority, alice, node).call("access")
+        assert client(authority, bob, node).call("access")["actor"] == "bob"
+    restore_event = [r["body"] for r in authority.export_log()["records"] if r["body"]["action"] == "restore"][-1]
+    assert restore_event["details"]["reapplied_revocations"] == [alice.device]
+    exported = authority.export_log()
+    verify_log(exported["records"], authority.trust, exported["checkpoint"])
+
+
+def test_backup_from_unknown_history_is_rejected(sandbox, tmp_path):
+    authority, _, _, bob = sandbox
+    backup = tmp_path / "b.backup"
+    authority.backup(backup)
+    client(authority, bob).call("access")
+    (authority.operator / "checkpoints.jsonl").write_bytes(b"")
+    with pytest.raises(ValueError, match="verification failed") as refused:
+        authority.restore(backup, accept_rollback=True)
+    assert "retained signed checkpoint" in str(refused.value.__cause__)
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_rollback_cannot_reactivate_a_retired_key(sandbox, tmp_path, legacy):
+    authority, _, alice, _ = sandbox
+    backup = tmp_path / "before-rotation.backup"
+    authority.backup(backup)
+    replacement = new_identity()
+    client(authority, alice).call("rotate", **alice.rotation(replacement))
+    before = authority.export_log()["checkpoint"]
+    if legacy:
+        # Older installations have no independently retained rotation floors yet.
+        (authority.operator / "revocations.json").unlink()
+    recovery = Authority(authority.directory, authority.operator, recovery_only=True)
+    with pytest.raises(ValueError, match="verification failed") as refused:
+        recovery.restore(backup, accept_rollback=True)
+    assert "committed key rotation" in str(refused.value.__cause__)
+    assert authority.export_log()["checkpoint"] == before
+    authority.recover()
+    for node in NODES:
+        with pytest.raises(Denied, match="retired"):
+            client(authority, alice, node).call("access")
+        current = Identity(alice.device, replacement, 2)
+        assert client(authority, current, node).call("access")["actor"] == "alice"
+
+
+def crash_restore(directory, operator, backup, phase):
+    def crash(here):
+        if here == phase:
+            os._exit(77)
+    Authority(directory, operator, fault=crash).restore(backup, accept_rollback=True)
+
+
+@pytest.mark.parametrize("phase", ["restore_prepared", "restore_replaced", "checkpoint_published", "restore_checkpointed"])
+def test_real_process_crash_during_rollback(sandbox, tmp_path, phase):
+    authority, operator, alice, bob = sandbox
+    backup = tmp_path / "rollback.backup"
+    authority.backup(backup)
+    operator.call("revoke", device=alice.device)
+    client(authority, bob).call("access")
+    process = multiprocessing.get_context("fork").Process(
+        target=crash_restore, args=(authority.directory, authority.operator, backup, phase))
+    process.start()
+    process.join(10)
+    assert not process.is_alive() and process.exitcode == 77
+    recovered = Authority(authority.directory, authority.operator)
+    recovered.recover()
+    assert json.loads((authority.operator / "restore-intent.json").read_bytes()) is None
+    # A crash before replacement retains the live history; later crashes finish the signed restore.
+    records = recovered.export_log()["records"]
+    assert any(r["body"]["action"] == "restore" for r in records) == (phase != "restore_prepared")
+    with contextlib.closing(connect(recovered.path)) as db:
+        head = recovered._head(db)
+    assert any(c["head"] == head for c in recovered._historical_checkpoints())
+    for node in NODES:
+        with pytest.raises(Denied, match="revoked"):
+            client(recovered, alice, node).call("access")
+        assert client(recovered, bob, node).call("access")["actor"] == "bob"
+    exported = recovered.export_log()
+    verify_log(exported["records"], recovered.trust, exported["checkpoint"])
+
+
+def test_forged_restore_intent_is_rejected(sandbox, tmp_path):
+    authority, operator, alice, _ = sandbox
+    backup = tmp_path / "rollback.backup"
+    authority.backup(backup)
+    operator.call("revoke", device=alice.device)
+    process = multiprocessing.get_context("fork").Process(
+        target=crash_restore, args=(authority.directory, authority.operator, backup, "restore_replaced"))
+    process.start()
+    process.join(10)
+    assert not process.is_alive() and process.exitcode == 77
+    path = authority.operator / "restore-intent.json"
+    intent = json.loads(path.read_bytes())
+    intent["body"]["checkpoint"]["head"]["hash"] = "0" * 64
+    path.write_text(json.dumps(intent))
+    with pytest.raises(InvalidSignature):
+        Authority(authority.directory, authority.operator).recover()

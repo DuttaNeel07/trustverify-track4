@@ -2,7 +2,7 @@ import copy
 
 import pytest
 
-from scripts.make_fixture import make_events
+from scripts.make_fixture import make_events, make_heldout_events
 from trustverify.detector import analyze, evaluate
 
 
@@ -125,3 +125,30 @@ def test_uncertain_permission_change_also_marks_the_beneficiary(action):
     result = analyze(events)
     assert not result["alerts"]
     assert result["timing_notices"][0]["path_alerts_suppressed_for_batch"] == ["alice", "operator"]
+
+
+def test_self_approved_grant_is_flagged_even_if_marked_approved():
+    events = [{"id": "g1", "actor": "operator", "action": "grant", "service": "frontend", "outcome": "allowed",
+               "observed_at": 10, "details": {"owner": "mallory", "target_service": "secrets",
+                                               "approved": True, "approved_by": "operator"}},
+              {"id": "g2", "actor": "operator", "action": "grant", "service": "frontend", "outcome": "allowed",
+               "observed_at": 20, "details": {"owner": "dana", "target_service": "secrets",
+                                               "approved": True, "approved_by": "security-officer"}}]
+    alerts = analyze(events)["alerts"]
+    assert [(a["event_id"], a["rule"]) for a in alerts] == [("g1", "self_approved_grant")]
+
+
+@pytest.mark.parametrize("seed", [7, 11, 23])
+def test_heldout_set_reports_known_misses_honestly(seed):
+    events = make_heldout_events(seed)
+    report = evaluate(events)
+    # Known weak spots are included on purpose: approved-edge insider access, slow lateral
+    # movement, first direct use after a self-approved grant, and late use of an approval.
+    assert report["malicious_events"] == 46 and report["false_negatives"] == 14
+    assert report["false_positives"] == 4 and 0.75 < report["f1"] < 0.8
+    names = {e["actor"] for e in events} - {"operator"}
+    assert all(name.startswith("u-") for name in names)
+    flipped = copy.deepcopy(events)
+    for event in flipped:
+        event["malicious"] = not event["malicious"]
+    assert analyze(events) == analyze(flipped)

@@ -2,6 +2,8 @@
 
 import json
 import sqlite3
+import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import unquote
 
@@ -11,6 +13,26 @@ from .authority import Authority, Denied, NODES
 from .crypto import canonical
 
 MAX_BODY = 64 * 1024
+# Requests that fail authentication share one bucket per node; valid identities never draw from it.
+UNAUTHENTICATED_BURST = 20
+UNAUTHENTICATED_PER_SECOND = 10.0
+
+
+class TokenBucket:
+    def __init__(self, capacity, rate, clock=time.monotonic):
+        self.capacity, self.rate, self.clock = capacity, rate, clock
+        self.tokens, self.updated = float(capacity), clock()
+        self.lock = threading.Lock()
+
+    def take(self):
+        with self.lock:
+            now = self.clock()
+            self.tokens = min(self.capacity, self.tokens + (now - self.updated) * self.rate)
+            self.updated = now
+            if self.tokens < 1:
+                return False
+            self.tokens -= 1
+            return True
 
 
 def serve(directory, operator, node, port):
@@ -18,6 +40,7 @@ def serve(directory, operator, node, port):
         raise ValueError("invalid node or port")
     authority = Authority(directory, operator)
     authority.recover()
+    unauthenticated = TokenBucket(UNAUTHENTICATED_BURST, UNAUTHENTICATED_PER_SECOND)
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"
@@ -70,6 +93,8 @@ def serve(directory, operator, node, port):
                 return result
             request = json.loads(body, object_pairs_hook=unique_pairs,
                                  parse_constant=lambda _: (_ for _ in ()).throw(ValueError("invalid number")))
+            if not (isinstance(request, dict) and authority.authenticates(request)) and not unauthenticated.take():
+                raise Denied("too many unauthenticated requests; slow down", 429)
             return authority.execute(node, request)
 
         def do_GET(self):

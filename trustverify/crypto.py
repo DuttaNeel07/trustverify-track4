@@ -1,36 +1,21 @@
-"""Library primitives only: ML-DSA-65, hybrid HPKE and AES-256-GCM."""
+"""Library primitives only: ML-DSA-65, hybrid HPKE and AES-256-GCM.
 
-import base64
-import json
+This module needs the optional ``cryptography`` dependency (the ``messaging``
+extra). The grader adapter never imports it; see ``trustverify.adapter``.
+"""
+
 import os
-import tempfile
-from pathlib import Path
 
 from cryptography.hazmat.primitives import hpke, serialization
 from cryptography.hazmat.primitives.asymmetric import mldsa
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+# Re-exported for existing callers; implemented with the standard library only.
+from .encoding import atomic_write, b64, canonical, unb64  # noqa: F401
+
 SUITE = hpke.Suite(hpke.KEM.MLKEM768_X25519, hpke.KDF.HKDF_SHA256,
                    hpke.AEAD.AES_256_GCM)
 DOMAIN = b"trustverify/v1/"
-
-
-def canonical(value):
-    return json.dumps(value, sort_keys=True, separators=(",", ":"),
-                      ensure_ascii=True, allow_nan=False).encode("ascii")
-
-
-def b64(value):
-    return base64.b64encode(value).decode("ascii")
-
-
-def unb64(value):
-    if not isinstance(value, str):
-        raise ValueError("expected base64 text")
-    decoded = base64.b64decode(value, validate=True)
-    if b64(decoded) != value:
-        raise ValueError("noncanonical base64 encoding")
-    return decoded
 
 
 def new_identity():
@@ -61,27 +46,6 @@ def load_private(data):
     if not isinstance(key, mldsa.MLDSA65PrivateKey):
         raise ValueError("expected ML-DSA-65 private key")
     return key
-
-
-def atomic_write(path, data, mode=0o600):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    fd, name = tempfile.mkstemp(prefix=".pending-", dir=path.parent)
-    try:
-        os.fchmod(fd, mode)
-        with os.fdopen(fd, "wb") as stream:
-            stream.write(data)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(name, path)
-        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-    finally:
-        if os.path.exists(name):
-            os.unlink(name)
 
 
 def seal_backup(key, plaintext, context):

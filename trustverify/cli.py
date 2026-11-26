@@ -4,12 +4,13 @@ import sqlite3
 import sys
 from pathlib import Path
 
-from cryptography.exceptions import InvalidSignature
-
-from .authority import Authority, Denied, NODES, verify_log
-from .client import Client, Identity, Remote
-from .crypto import atomic_write, canonical, new_identity, private_bytes, public
+from .constants import NODES
 from .detector import analyze, evaluate
+from .encoding import atomic_write, canonical
+
+# Commands that need the optional `messaging` extra import it lazily, so `evaluate` and
+# `practice` run in the judging runtime (Python 3.12 + pqcrypto only).
+LIGHT_COMMANDS = {"evaluate", "practice"}
 
 
 def load_json(path):
@@ -38,6 +39,8 @@ def parser():
             sub.add_argument("--output", required=True)
         if name == "restore":
             sub.add_argument("--input", required=True)
+            sub.add_argument("--accept-rollback", action="store_true",
+                             help="restore a verified backup older than the latest checkpoint")
     for name in ("call", "rotate"):
         sub = commands.add_parser(name)
         sub.add_argument("--url", required=True)
@@ -56,11 +59,25 @@ def parser():
     evaluation = commands.add_parser("evaluate")
     evaluation.add_argument("--input", default="fixtures/labelled_logs.json")
     evaluation.add_argument("--output")
+    practice = commands.add_parser("practice", help="run the detector on the toolkit's practice events")
+    practice.add_argument("--toolkit", required=True, help="toolkit practice/ directory (events.csv, approvals.json, labels.csv)")
+    practice.add_argument("--policy", help="service policy JSON (default: trustverify/service_policy.json)")
+    practice.add_argument("--output")
     return root
+
+
+class _NoSignatureError(Exception):
+    pass
 
 
 def main(argv=None):
     args = parser().parse_args(argv)
+    InvalidSignature, Denied = _NoSignatureError, _NoSignatureError
+    if args.command not in LIGHT_COMMANDS:
+        from cryptography.exceptions import InvalidSignature
+        from .authority import Authority, Denied, verify_log
+        from .client import Client, Identity, Remote
+        from .crypto import new_identity, private_bytes, public
     try:
         if args.command == "demo":
             from .demo import run
@@ -68,11 +85,14 @@ def main(argv=None):
         elif args.command == "init":
             directory = Path(args.directory)
             directory.mkdir(parents=True, exist_ok=False, mode=0o700)
-            admin = Identity.generate("operator-device")
+            admin, officer = Identity.generate("operator-device"), Identity.generate("officer-device")
             admin.save(directory / "identities" / "operator")
-            authority = Authority.initialize(directory / "authority", directory / "operator", public(admin.key))
+            officer.save(directory / "identities" / "security-officer")
+            authority = Authority.initialize(directory / "authority", directory / "operator", public(admin.key),
+                                             [("security-officer", officer.device, public(officer.key))])
             result = {"state": str(authority.directory), "operator": str(authority.operator),
-                      "admin_identity": str(directory / "identities" / "operator")}
+                      "admin_identity": str(directory / "identities" / "operator"),
+                      "approver_identity": str(directory / "identities" / "security-officer")}
         elif args.command == "identity":
             directory = Path(args.directory)
             if directory.exists():
@@ -89,7 +109,7 @@ def main(argv=None):
             if args.command == "backup":
                 result = authority.backup(args.output)
             elif args.command == "restore":
-                result = authority.restore(args.input)
+                result = authority.restore(args.input, accept_rollback=args.accept_rollback)
             elif args.command == "recover":
                 result = authority.recover()
             else:
@@ -119,6 +139,11 @@ def main(argv=None):
             result = {"verified": True, "head": head}
             if args.command == "detect":
                 result.update(analyze([r["body"] for r in exported["records"]]))
+            if args.output:
+                atomic_write(args.output, canonical(result))
+        elif args.command == "practice":
+            from .practice import DEFAULT_POLICY, run
+            result = run(args.toolkit, args.policy or DEFAULT_POLICY)
             if args.output:
                 atomic_write(args.output, canonical(result))
         elif args.command == "evaluate":

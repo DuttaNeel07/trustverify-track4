@@ -75,3 +75,17 @@ def test_client_does_not_follow_mock_service_redirects(status, method):
             server.shutdown()
             thread.join(timeout=5)
             assert not thread.is_alive()
+
+
+def test_unauthenticated_flood_is_throttled_without_locking_out_valid_users(sandbox):
+    authority, _, alice, _ = sandbox
+    junk = {"node": "node-a", "device": "nobody", "version": 1, "nonce": "x",
+            "action": "access", "data": {}, "signature": "AA=="}
+    with nodes(authority) as remotes:
+        statuses = []
+        for _ in range(40):
+            with pytest.raises(Denied) as failed:
+                remotes["node-a"].request(dict(junk))
+            statuses.append(failed.value.status)
+        assert 429 in statuses
+        assert Client(remotes["node-a"], alice, authority.trust).call("access")["actor"] == "alice"

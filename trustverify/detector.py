@@ -35,7 +35,13 @@ def analyze(events):
         action, details = event["action"], event.get("details", {})
         if event.get("outcome") == "allowed" and action == "grant":
             owner, service = details["owner"], details["target_service"]
-            if details.get("approved") is True:
+            if details.get("approved") is True and details.get("approved_by") == event["actor"]:
+                # Defense in depth: the authority enforces the two-person rule, but a log that
+                # shows the granting admin as its own approver is still suspicious.
+                approved_until.pop((owner, service), None)
+                emit(event, "self_approved_grant", owner, [service], [event["id"]],
+                     "Administrator granted access using an approval they issued themselves.", alert_at)
+            elif details.get("approved") is True:
                 if temporal:
                     approved_until[(owner, service)] = occurred + 300
                 else:

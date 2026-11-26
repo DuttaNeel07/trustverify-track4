@@ -1,0 +1,267 @@
+{
+  "alerts": [
+    {
+      "alert_at": 1768467840.1,
+      "events": [
+        "evt-008"
+      ],
+      "explanation": "viewer -> operator with no matching approval (subject, role, validity window and a different approver).",
+      "identity": "user-blair",
+      "rule": "unapproved_role_change",
+      "services": [
+        "identity"
+      ],
+      "trigger": "evt-008"
+    },
+    {
+      "alert_at": 1768467840.1,
+      "events": [
+        "evt-008",
+        "evt-009"
+      ],
+      "explanation": "Allowed activity in the same session after an unapproved role change.",
+      "identity": "user-blair",
+      "rule": "activity_after_unapproved_role_change",
+      "services": [
+        "portal",
+        "reports"
+      ],
+      "trigger": "evt-009"
+    },
+    {
+      "alert_at": 1768467902.2,
+      "events": [
+        "evt-010",
+        "evt-011"
+      ],
+      "explanation": "2 edges outside the service-reader policy in one session and flow: reports -> billing -> archive (outcomes: deny). Candidate only; denials do not show access.",
+      "identity": "svc-report-worker",
+      "rule": "lateral_movement_sequence",
+      "services": [
+        "reports",
+        "billing",
+        "archive"
+      ],
+      "trigger": "evt-011"
+    },
+    {
+      "alert_at": 1768467902.2,
+      "events": [
+        "evt-010",
+        "evt-011",
+        "evt-012"
+      ],
+      "explanation": "3 edges outside the service-reader policy in one session and flow: reports -> billing -> archive -> identity (outcomes: deny). Candidate only; denials do not show access.",
+      "identity": "svc-report-worker",
+      "rule": "lateral_movement_sequence",
+      "services": [
+        "reports",
+        "billing",
+        "archive",
+        "identity"
+      ],
+      "trigger": "evt-012"
+    }
+  ],
+  "evaluation": {
+    "benign_events": 17,
+    "caveat": "22 public practice events: a functional check only, not evidence of detection accuracy",
+    "events": 22,
+    "f1": 1.0,
+    "false_alerts_per_1000_benign_events": 0.0,
+    "false_negatives": 0,
+    "false_positives": 0,
+    "median_time_to_alert_seconds": 59.200000047683716,
+    "per_event": [
+      {
+        "event_id": "evt-001",
+        "flagged": false,
+        "label": "routine",
+        "rules": []
+      },
+      {
+        "event_id": "evt-002",
+        "flagged": false,
+        "label": "routine",
+        "rules": []
+      },
+      {
+        "event_id": "evt-003",
+        "flagged": false,
+        "label": "approved_change",
+        "rules": []
+      },
+      {
+        "event_id": "evt-004",
+        "flagged": false,
+        "label": "approved_change",
+        "rules": []
+      },
+      {
+        "event_id": "evt-005",
+        "flagged": false,
+        "label": "routine",
+        "rules": []
+      },
+      {
+        "event_id": "evt-006",
+        "flagged": false,
+        "label": "routine",
+        "rules": []
+      },
+      {
+        "event_id": "evt-007",
+        "flagged": false,
+        "label": "routine",
+        "rules": []
+      },
+      {
+        "event_id": "evt-008",
+        "flagged": true,
+        "label": "unexpected_role_change",
+        "rules": [
+          "activity_after_unapproved_role_change",
+          "unapproved_role_change"
+        ]
+      },
+      {
+        "event_id": "evt-009",
+        "flagged": true,
+        "label": "review_after_role_change",
+        "rules": [
+          "activity_after_unapproved_role_change"
+        ]
+      },
+      {
+        "event_id": "evt-010",
+        "flagged": true,
+        "label": "lateral_movement_candidate",
+        "rules": [
+          "lateral_movement_sequence"
+        ]
+      },
+      {
+        "event_id": "evt-011",
+        "flagged": true,
+        "label": "lateral_movement_candidate",
+        "rules": [
+          "lateral_movement_sequence"
+        ]
+      },
+      {
+        "event_id": "evt-012",
+        "flagged": true,
+        "label": "lateral_movement_candidate",
+        "rules": [
+          "lateral_movement_sequence"
+        ]
+      },
+      {
+        "event_id": "evt-014",
+        "flagged": false,
+        "label": "routine",
+        "rules": []
+      },
+      {
+        "event_id": "evt-013",
+        "flagged": false,
+        "label": "routine_delayed_delivery",
+        "rules": []
+      },
+      {
+        "event_id": "evt-015",
+        "flagged": false,
+        "label": "routine_clock_offset",
+        "rules": []
+      },
+      {
+        "event_id": "evt-016",
+        "flagged": false,
+        "label": "approved_change",
+        "rules": []
+      },
+      {
+        "event_id": "evt-017",
+        "flagged": false,
+        "label": "routine_denial",
+        "rules": []
+      },
+      {
+        "event_id": "evt-018",
+        "flagged": false,
+        "label": "routine_denial",
+        "rules": []
+      },
+      {
+        "event_id": "evt-019",
+        "flagged": false,
+        "label": "routine",
+        "rules": []
+      },
+      {
+        "event_id": "evt-020",
+        "flagged": false,
+        "label": "isolated_denial",
+        "rules": []
+      },
+      {
+        "event_id": "evt-021",
+        "flagged": false,
+        "label": "routine",
+        "rules": []
+      },
+      {
+        "event_id": "evt-022",
+        "flagged": false,
+        "label": "routine",
+        "rules": []
+      }
+    ],
+    "positive_events": 5,
+    "positive_labels": [
+      "lateral_movement_candidate",
+      "review_after_role_change",
+      "unexpected_role_change"
+    ],
+    "true_positives": 5
+  },
+  "notices": [
+    {
+      "edge": [
+        "reports",
+        "billing"
+      ],
+      "event_id": "evt-010",
+      "explanation": "one unexpected edge alone is not a movement sequence",
+      "notice": "isolated_unexpected_edge"
+    },
+    {
+      "event_id": "evt-013",
+      "explanation": "source evidence keeps receipt order; correlation uses corrected event time",
+      "notice": "out_of_order_arrival"
+    },
+    {
+      "corrected_delay_seconds": 0.2,
+      "event_id": "evt-015",
+      "notice": "clock_offset_corrected",
+      "offset_seconds": 2.0
+    },
+    {
+      "edge": [
+        "portal",
+        "billing"
+      ],
+      "event_id": "evt-020",
+      "explanation": "one unexpected edge alone is not a movement sequence",
+      "notice": "isolated_unexpected_edge"
+    }
+  ],
+  "timing": {
+    "max_clock_offset_seconds": 120,
+    "max_corrected_delay_seconds": 30.0,
+    "max_negative_skew_seconds": 1.0,
+    "offline_final_flush_seconds": 30.0,
+    "review_window_seconds": 600,
+    "sequence_window_seconds": 300
+  }
+}
