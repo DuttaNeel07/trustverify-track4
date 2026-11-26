@@ -71,7 +71,8 @@ class Store:
     def __init__(self, directory):
         self.directory = Path(directory)
         self.path = self.directory / "adapter-state.json"
-        self.key_path = self.directory / "adapter-audit.key"
+        # The signing key lives in its own 0700 directory, apart from the state it signs.
+        self.key_path = self.directory / "keys" / "adapter-audit.key"
 
     @contextlib.contextmanager
     def locked(self):
@@ -113,8 +114,24 @@ def _append(store, state, event):
         state["decisions"][body["request_id"]] = body["decision"]
 
 
-def verify_audit(state):
-    """Check sequence, hash chain and every ML-DSA-65 signature."""
+def key_fingerprint(public_key_b64):
+    return hashlib.sha256(unb64(public_key_b64)).hexdigest()
+
+
+def verify_audit(state, pinned_key_sha256=None, checkpoint=None):
+    """Check sequence, hash chain and every ML-DSA-65 signature.
+
+    The public key is stored next to the log, so on its own this only proves internal
+    consistency. Operators pin the fingerprint returned by ``setup`` (and optionally a
+    checkpoint ``{"seq", "head"}`` from an earlier verification) to detect a log that was
+    rewritten and re-signed under a substituted key.
+    """
+    if pinned_key_sha256 is not None and not hmac.compare_digest(
+            str(pinned_key_sha256), key_fingerprint(state["audit_public"])):
+        raise RequestError("audit key does not match the pinned fingerprint")
+    if checkpoint is not None and (not isinstance(checkpoint, dict) or type(checkpoint.get("seq")) is not int
+                                   or not isinstance(checkpoint.get("head"), str)):
+        raise RequestError("invalid checkpoint")
     public_key = unb64(state["audit_public"])
     previous = ZERO
     for count, record in enumerate(state["audit"], 1):
@@ -124,9 +141,21 @@ def verify_audit(state):
         if not ml_dsa_65.verify(public_key, DOMAIN + canonical(body), unb64(record["signature"])):
             raise RequestError(f"audit signature failure at event {count}")
         previous = _record_hash(record)
+        if checkpoint is not None and count == checkpoint["seq"] and previous != checkpoint["head"]:
+            raise RequestError("audit history differs from the pinned checkpoint")
     if previous != state["head"]:
         raise RequestError("audit head mismatch")
-    return {"verified": True, "events": len(state["audit"]), "head": previous}
+    if checkpoint is not None and checkpoint["seq"] > len(state["audit"]):
+        raise RequestError("audit truncated before the pinned checkpoint")
+    return {"verified": True, "anchored": pinned_key_sha256 is not None, "events": len(state["audit"]),
+            "seq": len(state["audit"]), "head": previous}
+
+
+def _content_intact(state, asset):
+    """Compare the stored body with the SHA-256 committed in the signed setup record."""
+    expected = state["audit"][0]["body"]["contents_sha256"].get(asset)
+    actual = hashlib.sha256(state["contents"][asset].encode("utf-8")).hexdigest()
+    return expected is not None and hmac.compare_digest(expected, actual)
 
 
 def _decide(state, actor, asset):
@@ -135,8 +164,10 @@ def _decide(state, actor, asset):
         return "deny", "actor revoked"
     if actor in state["disabled"]:
         return "deny", "actor disabled"
-    if state["owners"].get(asset) != actor:
+    if state["owners"].get(asset) != actor or asset not in state["contents"]:
         return "deny", "not the asset owner"
+    if not _content_intact(state, asset):
+        return "deny", "content integrity failure"
     return "allow", "owner"
 
 
@@ -164,9 +195,12 @@ def setup(store, request):
              "revoked": [], "decisions": {}, "audit": [], "head": ZERO}
     _append(store, state, {"op": "setup", "actor": None, "asset": None, "request_id": None,
                            "decision": "allow", "reason": "initialized",
-                           "assets": len(owners), "disabled": len(state["disabled"])})
+                           "assets": len(owners), "disabled": len(state["disabled"]),
+                           "contents_sha256": {asset: hashlib.sha256(body.encode("utf-8")).hexdigest()
+                                               for asset, body in contents.items()}})
     store.save(state)
-    return {"ready": True}
+    # Not secret: the operator pins this fingerprint to verify the audit log later.
+    return {"ready": True, "audit_key_sha256": key_fingerprint(state["audit_public"])}
 
 
 def read(store, state, request):
@@ -259,5 +293,5 @@ def dispatch(request, directory=None):
         if op == "protected_read":
             return protected_read(store, state, request)
         if op == "verify_audit":
-            return verify_audit(state)
+            return verify_audit(state, request.get("audit_key_sha256"), request.get("checkpoint"))
     raise RequestError("unknown op")

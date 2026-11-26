@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 from pqcrypto.kem import ml_kem_768
+from pqcrypto.sign import ml_dsa_65
 
 ROOT = Path(__file__).resolve().parents[1]
 ENTRY = ROOT / "track4_service.py"
@@ -31,7 +32,8 @@ def state(tmp_path):
     code, reply = call(tmp_path, op="setup", owners={"brief": "maya", "plan": "omar", "memo": "dana"},
                        contents={"brief": "demo note", "plan": "peer body", "memo": "disabled body"},
                        disabled=["dana"], key_material=MARKER)
-    assert (code, reply) == (0, {"ready": True})
+    assert code == 0 and reply["ready"] is True and len(reply["audit_key_sha256"]) == 64
+    (tmp_path / "pinned.txt").write_text(reply["audit_key_sha256"])
     return tmp_path
 
 
@@ -122,3 +124,62 @@ def test_setup_resets_previous_state(state):
     call(state, op="revoke", actor="maya")
     call(state, op="setup", owners={"brief": "maya"}, contents={"brief": "v2"}, disabled=[], key_material=MARKER)
     assert call(state, op="read", actor="maya", asset="brief", request_id="r50")[1]["body"] == "v2"
+
+
+def _resign_with_new_key(path, change):
+    """Attacker with write access: edit history, then re-sign it all under a fresh key."""
+    from trustverify.adapter import DOMAIN, ZERO, _record_hash
+    from trustverify.encoding import b64, canonical
+    document = json.loads(path.read_bytes())
+    public_key, secret_key = ml_dsa_65.generate_keypair()
+    document["audit_public"], previous = b64(public_key), ZERO
+    for record in document["audit"]:
+        change(record["body"], document)
+        record["body"]["previous"] = previous
+        record["signature"] = b64(ml_dsa_65.sign(secret_key, DOMAIN + canonical(record["body"])))
+        previous = _record_hash(record)
+    document["head"] = previous
+    path.write_text(json.dumps(document))
+
+
+def test_pinned_fingerprint_detects_a_resigned_log(state):
+    call(state, op="read", actor="maya", asset="brief", request_id="r60")
+    pinned = (state / "pinned.txt").read_text()
+    assert call(state, op="verify_audit", audit_key_sha256=pinned)[1]["anchored"] is True
+
+    def flip(body, document):
+        if body.get("request_id") == "r60":
+            body["decision"] = "deny"
+            document["decisions"]["r60"] = "deny"
+    _resign_with_new_key(state / "adapter-state.json", flip)
+    # Without the pin the rewritten log is only internally consistent...
+    assert call(state, op="verify_audit")[1]["anchored"] is False
+    # ...with the pinned fingerprint it is rejected.
+    code, reply = call(state, op="verify_audit", audit_key_sha256=pinned)
+    assert code == 1 and "fingerprint" in reply["error"]
+
+
+def test_pinned_checkpoint_detects_rewritten_or_truncated_history(state):
+    call(state, op="read", actor="maya", asset="brief", request_id="r70")
+    checkpoint = call(state, op="verify_audit")[1]
+    pin = {"seq": checkpoint["seq"], "head": checkpoint["head"]}
+    call(state, op="read", actor="omar", asset="plan", request_id="r71")
+    assert call(state, op="verify_audit", checkpoint=pin)[1]["verified"] is True
+    path = state / "adapter-state.json"
+    document = json.loads(path.read_bytes())
+    document["audit"] = document["audit"][:1]
+    document["head"] = __import__("trustverify.adapter", fromlist=["_record_hash"])._record_hash(document["audit"][0])
+    path.write_text(json.dumps(document))
+    code, reply = call(state, op="verify_audit", checkpoint=pin)
+    assert code == 1
+
+
+def test_tampered_body_is_never_served(state):
+    path = state / "adapter-state.json"
+    document = json.loads(path.read_bytes())
+    document["contents"]["brief"] = "attacker text"
+    path.write_text(json.dumps(document))
+    assert call(state, op="read", actor="maya", asset="brief", request_id="r80")[1] == {"decision": "deny"}
+    public_key, _ = ml_kem_768.generate_keypair()
+    assert call(state, op="protected_read", actor="maya", asset="brief", challenge="c",
+                public_key=base64.b64encode(public_key).decode())[1] == {"decision": "deny"}

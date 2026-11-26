@@ -294,3 +294,33 @@ def test_backup_from_unknown_history_is_rejected(sandbox, tmp_path):
     with pytest.raises(ValueError, match="verification failed") as refused:
         authority.restore(backup, accept_rollback=True)
     assert "retained signed checkpoint" in str(refused.value.__cause__)
+
+
+def test_challenge_flood_cannot_lock_out_enrolled_devices(sandbox):
+    authority, operator, alice, bob = sandbox
+    for _ in range(authority.ANONYMOUS_CHALLENGES * 3):
+        authority.challenge("node-a")
+    for _ in range(authority.CHALLENGES_PER_DEVICE * 3):
+        authority.challenge("node-a", "nobody-device")
+    assert client(authority, alice).call("access")["actor"] == "alice"
+    assert operator.call("access")["actor"] == "operator"
+    with contextlib.closing(connect(authority.path)) as db:
+        assert db.execute("SELECT COUNT(*) FROM nonces").fetchone()[0] <= authority.ANONYMOUS_CHALLENGES
+
+
+def test_device_bound_challenge_cannot_be_used_by_another_device(sandbox):
+    authority, _, alice, bob = sandbox
+    nonce = authority.challenge("node-a", alice.device)
+    value = {"node": "node-a", "device": bob.device, "version": bob.version, "nonce": nonce,
+             "action": "access", "data": {}}
+    with pytest.raises(Denied, match="incorrectly bound"):
+        authority.execute("node-a", {**value, "signature": sign(bob.key, "request", value)})
+
+
+def test_directory_lookup_requires_authentication(sandbox):
+    authority, _, alice, bob = sandbox
+    assert client(authority, alice).directory(bob.device)["owner"] == "bob"
+    junk = {"node": "node-a", "device": "nobody", "version": 1, "nonce": "x",
+            "action": "directory", "data": {"device": bob.device}, "signature": "AA=="}
+    with pytest.raises(Denied):
+        authority.execute("node-a", junk)

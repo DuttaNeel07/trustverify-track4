@@ -29,7 +29,7 @@ CREATE TABLE devices (id TEXT PRIMARY KEY, owner TEXT NOT NULL REFERENCES users(
 CREATE TABLE keys (device TEXT NOT NULL REFERENCES devices(id), version INTEGER NOT NULL, public TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('active','retired','revoked')), PRIMARY KEY(device,version));
 CREATE TABLE permissions (owner TEXT NOT NULL REFERENCES users(id), service TEXT NOT NULL, PRIMARY KEY(owner,service));
 CREATE TABLE approvals (id TEXT PRIMARY KEY, owner TEXT NOT NULL, service TEXT NOT NULL, approved_by TEXT NOT NULL, expires REAL NOT NULL, used INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE nonces (nonce TEXT PRIMARY KEY, node TEXT NOT NULL, expires REAL NOT NULL);
+CREATE TABLE nonces (nonce TEXT PRIMARY KEY, node TEXT NOT NULL, device TEXT, issued REAL NOT NULL, expires REAL NOT NULL);
 CREATE TABLE transfers (id TEXT PRIMARY KEY, sender TEXT NOT NULL, sender_version INTEGER NOT NULL, recipient TEXT NOT NULL, recipient_version INTEGER NOT NULL, manifest TEXT NOT NULL, status TEXT NOT NULL, expires REAL NOT NULL);
 CREATE TABLE chunks (transfer_id TEXT NOT NULL REFERENCES transfers(id), idx INTEGER NOT NULL, body BLOB NOT NULL, PRIMARY KEY(transfer_id,idx));
 CREATE TABLE audit (seq INTEGER PRIMARY KEY, body TEXT NOT NULL, signature TEXT NOT NULL);
@@ -296,20 +296,34 @@ class Authority:
         except Exception:  # noqa: BLE001 - any failure simply means "not authenticated"
             return False
 
-    def challenge(self, node):
+    # Open challenges are bounded per device and in one shared pool for callers that name no
+    # known device. A full bucket evicts its own oldest challenge instead of refusing, so
+    # anonymous floods can never exhaust the challenges of enrolled devices.
+    CHALLENGES_PER_DEVICE = 16
+    ANONYMOUS_CHALLENGES = 256
+
+    def challenge(self, node, device=None):
         if node not in NODES:
             raise ValueError("unknown node")
         with self.locked(), contextlib.closing(connect(self.path)) as db:
             self._check_state(db)
             with db:
                 db.execute("DELETE FROM nonces WHERE expires<?", (self.now(),))
-                if db.execute("SELECT COUNT(*) FROM nonces").fetchone()[0] >= 4096:
-                    raise Denied("challenge capacity reached", 429)
+                known = device is not None and isinstance(device, str) and IDENTIFIER.fullmatch(device) and \
+                    db.execute("SELECT 1 FROM devices WHERE id=? AND revoked=0", (device,)).fetchone()
+                bound = device if known else None
+                limit = self.CHALLENGES_PER_DEVICE if known else self.ANONYMOUS_CHALLENGES
+                where, args = ("device=?", (bound,)) if known else ("device IS NULL", ())
+                count = db.execute(f"SELECT COUNT(*) FROM nonces WHERE {where}", args).fetchone()[0]
+                if count >= limit:
+                    db.execute(f"DELETE FROM nonces WHERE nonce IN (SELECT nonce FROM nonces WHERE {where} "
+                               "ORDER BY issued LIMIT ?)", (*args, count - limit + 1))
                 nonce = uuid.uuid4().hex + uuid.uuid4().hex
-                db.execute("INSERT INTO nonces VALUES (?,?,?)", (nonce, node, self.now() + 30))
+                db.execute("INSERT INTO nonces VALUES (?,?,?,?,?)", (nonce, node, bound, self.now(), self.now() + 30))
             return nonce
 
     def directory_entry(self, device):
+        """Operator-side lookup (no HTTP endpoint). Network clients use the authenticated action."""
         identifier(device)
         with self.locked(), contextlib.closing(connect(self.path)) as db:
             self._check_state(db)
@@ -341,7 +355,8 @@ class Authority:
                 verify(key["public"], "request", {k: v for k, v in request.items() if k != "signature"}, request["signature"])
                 actor, authenticated_device = key["owner"], key["device"]
                 nonce = db.execute("SELECT * FROM nonces WHERE nonce=?", (request["nonce"],)).fetchone()
-                if nonce is None or nonce["node"] != node or nonce["expires"] < self.now():
+                if (nonce is None or nonce["node"] != node or nonce["expires"] < self.now()
+                        or (nonce["device"] is not None and nonce["device"] != key["device"])):
                     raise Denied("expired, replayed or incorrectly bound request")
                 db.execute("DELETE FROM nonces WHERE nonce=?", (request["nonce"],))
                 if key["revoked"] or key["state"] == "revoked":
@@ -411,6 +426,14 @@ class Authority:
         service = NODES[node]
         if action in {"enroll", "revoke", "approve", "grant", "remove_permission"} and key["role"] != "admin":
             raise Denied("administrator required")
+        if action == "directory":
+            # Any authenticated device may look up a peer's current key; anonymous callers may not.
+            target = identifier(data["device"])
+            row = db.execute("SELECT d.id,d.owner,d.version,d.revoked,k.public,k.state FROM devices d JOIN keys k ON d.id=k.device AND d.version=k.version WHERE d.id=?", (target,)).fetchone()
+            if row is None:
+                raise Denied("unknown device", 404)
+            value = dict(row)
+            return {"entry": value, "signature": sign(self.audit_key, "directory", value)}, {"target_device": target}
         if action == "enroll":
             owner, device = identifier(data["owner"]), identifier(data["device"])
             proof = {"owner": owner, "device": device, "public": data["public"]}
