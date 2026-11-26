@@ -6,10 +6,10 @@ Rules
 - ``unapproved_role_change``: a successful role change with no matching, valid approval
   (same subject and role, inside the exclusive validity window, approved by someone else,
   and approved by an event the collector has already received).
-- ``activity_after_unapproved_role_change``: later allowed activity in the same session
-  within ``REVIEW_WINDOW`` seconds of a flagged role change.
+- ``activity_after_unapproved_role_change``: later allowed activity by the same identity in
+  the same session within ``REVIEW_WINDOW`` seconds of a flagged role change.
 - ``lateral_movement_sequence``: two or more service edges outside the role's policy in the
-  same session and correlation flow within ``SEQUENCE_WINDOW`` seconds. A single unexpected
+  same identity, session and correlation flow within ``SEQUENCE_WINDOW`` seconds. A single unexpected
   edge is reported as a notice, not an alert.
 Timing
 - Corrected event time = source time minus the stated source clock offset.
@@ -17,8 +17,9 @@ Timing
   received produces an ``out_of_order_arrival`` notice; a nonzero offset produces a
   ``clock_offset_corrected`` notice. The supported range is shared with the main detector
   (``trustverify.constants``): offsets up to 120 s and corrected delay in [-1 s, 30 s].
-  Outside it, or when two events of one session share a corrected timestamp across
-  different services, the order is flagged as uncertain and no sequence alert is built on it.
+- Correlation uses corrected event time through a ``MAX_LATENESS`` reorder buffer. Timing
+  outside the supported range, or two events of one identity with equal corrected
+  timestamps, flags the order as uncertain and withholds temporal alerts for that identity.
 Baseline
 - An edge is expected if the role policy lists it, or if it has already been observed as
   allowed for that role by at least ``BASELINE_MIN_IDENTITIES`` distinct identities. Roles
@@ -26,6 +27,7 @@ Baseline
 """
 
 import csv
+import heapq
 import json
 import statistics
 from datetime import datetime
@@ -73,16 +75,17 @@ def load_policy(path=DEFAULT_POLICY):
 def analyze(events, approvals, policy, learn=True):
     alerts, notices = [], []
     learned = {}                # (role, edge) -> identities observed using it successfully
-    last_seen = {}              # session -> (corrected time, target service)
-    approved_seen = {}          # approval_id -> (approver, corrected time) once received
-    flagged_sessions = {}       # session -> (role-change event, corrected time)
-    unexpected = {}             # (session, correlation) -> [events]
+    approved_seen = {}          # approval_id -> approval event
+    flagged_sessions = {}       # (actor, session) -> (role-change event, corrected time)
+    unexpected = {}             # (actor, session, correlation) -> [events]
+    queue, uncertain, seen_times = [], set(), set()
     latest_corrected = None
+    latest_arrival = float("-inf")
 
-    def alert(rule, event, evidence, explanation, services):
+    def alert(rule, event, evidence, explanation, services, alert_at):
         alerts.append({"rule": rule, "identity": event["actor"], "services": services,
                        "events": evidence, "trigger": event["event_id"],
-                       "alert_at": event["received_at"], "explanation": explanation})
+                       "alert_at": alert_at, "explanation": explanation})
 
     def scope_allows(event, at):
         change = approvals.get(event["approval_id"]) if event["approval_id"] else None
@@ -105,50 +108,34 @@ def analyze(events, approvals, policy, learn=True):
                 return True
         return False
 
-    for event in events:  # receipt order
+    def process(event, alert_at):
         at = event["corrected_at"]
-        delay = event["received_at"] - at
-        if event["offset_seconds"]:
-            notices.append({"event_id": event["event_id"], "notice": "clock_offset_corrected",
-                            "offset_seconds": event["offset_seconds"], "corrected_delay_seconds": round(delay, 3)})
-        uncertain = False
-        if abs(event["offset_seconds"]) > MAX_CLOCK_OFFSET or not -MAX_NEGATIVE_SKEW <= delay <= MAX_LATENESS:
-            uncertain = True
-            notices.append({"event_id": event["event_id"], "notice": "event_order_uncertain",
-                            "reason": "outside supported clock/arrival range",
-                            "corrected_delay_seconds": round(delay, 3)})
-        previous = last_seen.get(event["session_id"])
-        if previous and previous[0] == at and previous[1] != event["target_service"]:
-            uncertain = True
-            notices.append({"event_id": event["event_id"], "notice": "event_order_uncertain",
-                            "reason": "equal corrected timestamps in one session; service order unknown"})
-        last_seen[event["session_id"]] = (at, event["target_service"])
-        if latest_corrected is not None and at < latest_corrected:
-            notices.append({"event_id": event["event_id"], "notice": "out_of_order_arrival",
-                            "explanation": "occurred before an event already received; receipt order kept"})
-        latest_corrected = at if latest_corrected is None else max(latest_corrected, at)
-
+        session = (event["actor"], event["session_id"])
         action, success = event["action"], event["outcome"] in {"success", "allow"}
         if action == "approve_role_change" and success and event["approval_id"]:
-            approved_seen[event["approval_id"]] = (event["actor"], at)
+            approved_seen[event["approval_id"]] = event
         if action == "role_change" and success and event["role_after"] != event["role_before"]:
             change = approvals.get(event["approval_id"]) if event["approval_id"] else None
+            approval = approved_seen.get(event["approval_id"])
             matched = bool(change and change["operation"] == "grant_role" and change["subject"] == event["actor"]
                            and change["role"] == event["role_after"] and change["approved_by"] != event["actor"]
                            and _time(change["valid_from_utc"]) <= at < _time(change["valid_until_utc"])
-                           and approved_seen.get(event["approval_id"], (None,))[0] == change["approved_by"])
+                           and approval and approval["actor"] == change["approved_by"]
+                           and approval["received_at"] <= event["received_at"])
             if not matched:
-                flagged_sessions[event["session_id"]] = (event, at)
+                flagged_sessions[session] = (event, at)
                 alert("unapproved_role_change", event, [event["event_id"]],
                       f"{event['role_before']} -> {event['role_after']} with no matching approval "
-                      "(subject, role, validity window and a different approver).", [event["target_service"]])
-            continue
-        flagged = flagged_sessions.get(event["session_id"])
+                      "(subject, role, validity window and a different approver).", [event["target_service"]], alert_at)
+            return
+        if event["actor"] in uncertain:
+            return
+        flagged = flagged_sessions.get(session)
         if flagged and success and 0 <= at - flagged[1] <= REVIEW_WINDOW:
             alert("activity_after_unapproved_role_change", event, [flagged[0]["event_id"], event["event_id"]],
                   "Allowed activity in the same session after an unapproved role change.",
-                  [event["source_service"], event["target_service"]])
-            continue
+                  [event["source_service"], event["target_service"]], alert_at)
+            return
         edge = (event["source_service"], event["target_service"])
         role = event["role_before"]
         observed = learned.setdefault((role, edge), set())
@@ -156,26 +143,60 @@ def analyze(events, approvals, policy, learn=True):
         if success:
             observed.add(event["actor"])
         if edge in policy.get(role, set()) or baseline or scope_allows(event, at) or denied_after_revocation(event, at):
-            continue
-        if uncertain:
-            continue
-        key = (event["session_id"], event["correlation_id"])
-        group = [e for e in unexpected.get(key, []) if at - e["corrected_at"] <= SEQUENCE_WINDOW]
+            return
+        key = (*session, event["correlation_id"])
+        group = [e for e in unexpected.get(key, []) if 0 <= at - e["corrected_at"] <= SEQUENCE_WINDOW]
         group.append(event)
         unexpected[key] = group
         if len(group) == 1:
             notices.append({"event_id": event["event_id"], "notice": "isolated_unexpected_edge",
                             "edge": list(edge), "explanation": "one unexpected edge alone is not a movement sequence"})
-            continue
+            return
         path = [group[0]["source_service"]] + [e["target_service"] for e in group]
         outcomes = sorted({e["outcome"] for e in group})
         alert("lateral_movement_sequence", event, [e["event_id"] for e in group],
               f"{len(group)} edges outside the {event['role_before']} policy in one session and flow: "
               f"{' -> '.join(path)} (outcomes: {', '.join(outcomes)}). Candidate only; denials do not show access.",
-              path)
+              path, alert_at)
+
+    for position, event in enumerate(events):  # receipt order, retained in the source evidence
+        arrival, at = event["received_at"], event["corrected_at"]
+        if arrival < latest_arrival:
+            raise ValueError("input must follow collector arrival order")
+        latest_arrival = arrival
+        delay = arrival - at
+        if event["offset_seconds"]:
+            notices.append({"event_id": event["event_id"], "notice": "clock_offset_corrected",
+                            "offset_seconds": event["offset_seconds"], "corrected_delay_seconds": round(delay, 3)})
+        stamp = (event["actor"], at)
+        if not -MAX_NEGATIVE_SKEW <= delay <= MAX_LATENESS or abs(event["offset_seconds"]) > MAX_CLOCK_OFFSET:
+            reason = "outside supported clock/arrival range"
+        elif stamp in seen_times:
+            reason = "equal corrected timestamps for one identity; order unknown"
+        else:
+            reason = None
+        if reason:
+            uncertain.add(event["actor"])
+            notices.append({"event_id": event["event_id"], "notice": "event_order_uncertain", "reason": reason,
+                            "corrected_delay_seconds": round(delay, 3),
+                            "explanation": "temporal alerts withheld for this identity"})
+        seen_times.add(stamp)
+        if latest_corrected is not None and at < latest_corrected:
+            notices.append({"event_id": event["event_id"], "notice": "out_of_order_arrival",
+                            "explanation": "source evidence keeps receipt order; correlation uses corrected event time"})
+        latest_corrected = at if latest_corrected is None else max(latest_corrected, at)
+        heapq.heappush(queue, (at, position, event))
+        while queue and queue[0][0] <= arrival - MAX_LATENESS:
+            _, _, ready = heapq.heappop(queue)
+            process(ready, arrival)
+    flush_at = latest_arrival + MAX_LATENESS
+    while queue:
+        _, _, ready = heapq.heappop(queue)
+        process(ready, flush_at)
+    alerts = [a for a in alerts if a["rule"] == "unapproved_role_change" or a["identity"] not in uncertain]
     return {"alerts": alerts, "notices": notices,
             "timing": {"max_clock_offset_seconds": MAX_CLOCK_OFFSET, "max_corrected_delay_seconds": MAX_LATENESS,
-                       "max_negative_skew_seconds": MAX_NEGATIVE_SKEW,
+                       "max_negative_skew_seconds": MAX_NEGATIVE_SKEW, "offline_final_flush_seconds": MAX_LATENESS,
                        "sequence_window_seconds": SEQUENCE_WINDOW, "review_window_seconds": REVIEW_WINDOW}}
 
 

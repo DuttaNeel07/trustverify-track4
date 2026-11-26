@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from trustverify.practice import load_policy, run
+from trustverify.practice import load_events, load_policy, run
 
 HEADER = ["event_id", "event_time_utc", "received_time_utc", "source_clock_offset_ms", "actor",
           "source_service", "target_service", "action", "role_before", "role_after", "outcome",
@@ -86,6 +86,63 @@ def test_reordered_and_offset_events_produce_timing_notices(tmp_path):
 def test_policy_never_grants_scope_that_needs_an_approval():
     policy = load_policy()
     assert ("portal", "reports") not in policy["report-reader"]
+
+
+def test_shared_session_and_flow_do_not_combine_identities(tmp_path):
+    edges = write(tmp_path / "edges", [
+        row("alice-edge", 1, "alice", "portal", "billing", "read", "viewer", "viewer", "allow"),
+        row("bob-edge", 2, "bob", "billing", "secrets", "read", "viewer", "viewer", "allow")], [])
+    assert edges["alerts"] == []
+    roles = write(tmp_path / "roles", [
+        row("alice-change", 1, "alice", "portal", "identity", "role_change", "viewer", "operator", "success"),
+        row("bob-normal", 2, "bob", "portal", "catalog", "read", "viewer", "viewer", "allow")], [])
+    assert rules(roles) == [("unapproved_role_change", ["alice-change"])]
+    assert roles["alerts"][0]["identity"] == "alice"
+
+
+def test_reordered_edges_use_corrected_path_and_keep_receipt_evidence(tmp_path):
+    rows = [
+        row("hop-2", 2, "eve", "billing", "secrets", "read", "viewer", "viewer", "allow",
+            received="2026-01-15T09:00:03Z"),
+        row("hop-1", 1, "eve", "portal", "billing", "read", "viewer", "viewer", "allow",
+            received="2026-01-15T09:00:04Z")]
+    result = write(tmp_path / "d", rows, [])
+    assert rules(result) == [("lateral_movement_sequence", ["hop-1", "hop-2"])]
+    assert result["alerts"][0]["services"] == ["portal", "billing", "secrets"]
+    assert result["alerts"][0]["alert_at"] >= max(e["received_at"] for e in load_events(tmp_path / "d" / "events.csv"))
+    with open(tmp_path / "d" / "events.csv", newline="") as stream:
+        assert [r["event_id"] for r in csv.DictReader(stream)] == ["hop-2", "hop-1"]
+
+
+def test_activity_received_before_earlier_role_change_is_detected(tmp_path):
+    result = write(tmp_path / "d", [
+        row("activity", 12, "eve", "portal", "billing", "read", "operator", "operator", "allow",
+            received="2026-01-15T09:00:13Z"),
+        row("change", 10, "eve", "portal", "identity", "role_change", "viewer", "operator", "success",
+            received="2026-01-15T09:00:20Z")], [])
+    assert rules(result) == [("unapproved_role_change", ["change"]),
+                             ("activity_after_unapproved_role_change", ["change", "activity"])]
+    assert result["alerts"][1]["alert_at"] >= result["alerts"][0]["alert_at"]
+
+
+@pytest.mark.parametrize("second,received", [(1, "2026-01-15T09:00:02Z"),
+                                              (2, "2026-01-15T09:00:40Z")])
+def test_ambiguous_or_unsupported_time_withholds_temporal_alerts(tmp_path, second, received):
+    result = write(tmp_path / "d", [
+        row("hop-1", 1, "eve", "portal", "billing", "read", "viewer", "viewer", "allow"),
+        row("hop-2", second, "eve", "billing", "secrets", "read", "viewer", "viewer", "allow",
+            received=received)], [])
+    assert result["alerts"] == []
+    assert any(n["notice"] == "event_order_uncertain" for n in result["notices"])
+
+
+def test_reordering_does_not_count_an_approval_received_later(tmp_path):
+    result = write(tmp_path / "d", [
+        row("change", 2, "eve", "admin-console", "identity", "role_change", "viewer", "report-reader",
+            "success", "c1", received="2026-01-15T09:00:03Z"),
+        row("approval", 1, "admin", "admin-console", "identity", "approve_role_change", "operator", "operator",
+            "success", "c1", received="2026-01-15T09:00:04Z")], [GRANT])
+    assert rules(result) == [("unapproved_role_change", ["change"])]
 
 
 @pytest.mark.skipif(not (TOOLKIT / "events.csv").exists(), reason="toolkit practice data not checked out")

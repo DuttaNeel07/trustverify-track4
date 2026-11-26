@@ -349,3 +349,81 @@ def test_live_watch_detects_and_contains_an_unapproved_grant(sandbox, tmp_path):
     assert len(lines) == len(alerts)
     removal = [r["body"] for r in authority.export_log()["records"] if r["body"]["action"] == "remove_permission"]
     assert removal[-1]["actor"] == "security-officer"
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_rollback_cannot_reactivate_a_retired_key(sandbox, tmp_path, legacy):
+    authority, _, alice, _ = sandbox
+    backup = tmp_path / "before-rotation.backup"
+    authority.backup(backup)
+    replacement = new_identity()
+    client(authority, alice).call("rotate", **alice.rotation(replacement))
+    before = authority.export_log()["checkpoint"]
+    if legacy:
+        # Older installations have no independently retained rotation floors yet.
+        (authority.operator / "revocations.json").unlink()
+    recovery = Authority(authority.directory, authority.operator, recovery_only=True)
+    with pytest.raises(ValueError, match="verification failed") as refused:
+        recovery.restore(backup, accept_rollback=True)
+    assert "committed key rotation" in str(refused.value.__cause__)
+    assert authority.export_log()["checkpoint"] == before
+    authority.recover()
+    for node in NODES:
+        with pytest.raises(Denied, match="retired"):
+            client(authority, alice, node).call("access")
+        current = Identity(alice.device, replacement, 2)
+        assert client(authority, current, node).call("access")["actor"] == "alice"
+
+
+def crash_restore(directory, operator, backup, phase):
+    def crash(here):
+        if here == phase:
+            os._exit(77)
+    Authority(directory, operator, fault=crash).restore(backup, accept_rollback=True)
+
+
+@pytest.mark.parametrize("phase", ["restore_prepared", "restore_replaced", "checkpoint_published", "restore_checkpointed"])
+def test_real_process_crash_during_rollback(sandbox, tmp_path, phase):
+    authority, operator, alice, bob = sandbox
+    backup = tmp_path / "rollback.backup"
+    authority.backup(backup)
+    operator.call("revoke", device=alice.device)
+    client(authority, bob).call("access")
+    process = multiprocessing.get_context("fork").Process(
+        target=crash_restore, args=(authority.directory, authority.operator, backup, phase))
+    process.start()
+    process.join(10)
+    assert not process.is_alive() and process.exitcode == 77
+    recovered = Authority(authority.directory, authority.operator)
+    recovered.recover()
+    assert json.loads((authority.operator / "restore-intent.json").read_bytes()) is None
+    # A crash before replacement retains the live history; later crashes finish the signed restore.
+    records = recovered.export_log()["records"]
+    assert any(r["body"]["action"] == "restore" for r in records) == (phase != "restore_prepared")
+    with contextlib.closing(connect(recovered.path)) as db:
+        head = recovered._head(db)
+    assert any(c["head"] == head for c in recovered._historical_checkpoints())
+    for node in NODES:
+        with pytest.raises(Denied, match="revoked"):
+            client(recovered, alice, node).call("access")
+        assert client(recovered, bob, node).call("access")["actor"] == "bob"
+    exported = recovered.export_log()
+    verify_log(exported["records"], recovered.trust, exported["checkpoint"])
+
+
+def test_forged_restore_intent_is_rejected(sandbox, tmp_path):
+    authority, operator, alice, _ = sandbox
+    backup = tmp_path / "rollback.backup"
+    authority.backup(backup)
+    operator.call("revoke", device=alice.device)
+    process = multiprocessing.get_context("fork").Process(
+        target=crash_restore, args=(authority.directory, authority.operator, backup, "restore_replaced"))
+    process.start()
+    process.join(10)
+    assert not process.is_alive() and process.exitcode == 77
+    path = authority.operator / "restore-intent.json"
+    intent = json.loads(path.read_bytes())
+    intent["body"]["checkpoint"]["head"]["hash"] = "0" * 64
+    path.write_text(json.dumps(intent))
+    with pytest.raises(InvalidSignature):
+        Authority(authority.directory, authority.operator).recover()
