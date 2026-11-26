@@ -1,6 +1,6 @@
 # TrustVerify — Track 4: Trust, but verify
 
-Public source: [jayantkageri/trustverify-track4](https://github.com/jayantkageri/trustverify-track4).
+Public source: [jayantkageriofficial/trustverify-track4](https://github.com/jayantkageriofficial/trustverify-track4).
 
 A working organizer-sandbox prototype that connects **post-quantum encrypted transfers, device/key lifecycle controls, verifiable access decisions and contextual detection**. No AI/ML components, hard-coded secrets or custom cryptographic primitives.
 
@@ -37,7 +37,7 @@ uv run --locked trustverify demo --directory runtime/first-demo
 
 Runtime dependency: `cryptography==50.0.2`. Development/document dependencies: `pytest==9.2.0`, `reportlab==5.1.2`. The exact transitive resolution is in [uv.lock](uv.lock). Algorithm and library attribution is in [THIRD_PARTY.md](THIRD_PARTY.md).
 
-[GitHub Actions verification](https://github.com/jayantkageri/trustverify-track4/actions) installs the project on a fresh Linux runner, runs all tests and the three-process demo, verifies its audit export, regenerates the PDF, and builds/tests/runs the Docker image without external runtime networking. See [.github/workflows/verify.yml](.github/workflows/verify.yml).
+[GitHub Actions verification](https://github.com/jayantkageriofficial/trustverify-track4/actions) installs the project on a fresh Linux runner, runs all tests and the three-process demo, verifies its audit export, regenerates the PDF, and builds/tests/runs the Docker image without external runtime networking. See [.github/workflows/verify.yml](.github/workflows/verify.yml).
 
 ## Run and inspect the evidence
 
