@@ -177,37 +177,51 @@ class Authority:
     def _checkpoint(self, db):
         head = self._head(db)
         path = self.operator / "checkpoint.json"
+        self._sync_tombstones(db)
+        checkpoint = None
         if path.exists():
             existing = json.loads(path.read_bytes())
             if existing["head"] == head:
                 verify(self.trust["audit_public"], "checkpoint", head, existing["signature"])
-                return
-        self._sync_tombstones(db)
-        checkpoint = {"head": head, "signature": sign(self.audit_key, "checkpoint", head)}
-        atomic_write(path, canonical(checkpoint))
+                checkpoint = existing
+        if checkpoint is None:
+            checkpoint = {"head": head, "signature": sign(self.audit_key, "checkpoint", head)}
+            atomic_write(path, canonical(checkpoint))
+            if self.fault:
+                self.fault("checkpoint_published")
         # Append-only history lets an older verified backup be restored deliberately.
-        with open(self.operator / "checkpoints.jsonl", "ab") as stream:
-            stream.write(canonical(checkpoint) + b"\n")
+        line = canonical(checkpoint) + b"\n"
+        with open(self.operator / "checkpoints.jsonl", "a+b") as stream:
+            end = stream.tell()
+            stream.seek(max(0, end - len(line)))
+            tail = stream.read()
+            if tail == line:
+                return
+            # A crash may have published the checkpoint but left a torn history line.
+            stream.write((b"\n" if tail and not tail.endswith(b"\n") else b"") + line)
             stream.flush()
             os.fsync(stream.fileno())
 
     def _tombstones(self):
         path = self.operator / "revocations.json"
         if not path.exists():
-            return []
+            return {"devices": [], "versions": {}}
         value = json.loads(path.read_bytes())
         verify(self.trust["audit_public"], "tombstones", value["body"], value["signature"])
         if value["body"]["cluster"] != self.trust["cluster"]:
             raise ValueError("tombstone cluster mismatch")
-        return value["body"]["devices"]
+        return {"devices": value["body"]["devices"], "versions": value["body"].get("versions", {})}
 
     def _sync_tombstones(self, db):
-        """Revoked devices are copied outside the database so no restore can resurrect them."""
-        known = set(self._tombstones())
+        """Keep revocations and committed rotation floors outside rollback storage."""
+        retained = self._tombstones()
+        known, versions = set(retained["devices"]), dict(retained["versions"])
         revoked = {row[0] for row in db.execute("SELECT id FROM devices WHERE revoked=1")}
-        if revoked <= known:
+        for row in db.execute("SELECT id,version FROM devices WHERE version>1"):
+            versions[row["id"]] = max(versions.get(row["id"], 0), row["version"])
+        if revoked <= known and versions == retained["versions"]:
             return
-        body = {"cluster": self.trust["cluster"], "devices": sorted(known | revoked)}
+        body = {"cluster": self.trust["cluster"], "devices": sorted(known | revoked), "versions": versions}
         atomic_write(self.operator / "revocations.json",
                      canonical({"body": body, "signature": sign(self.audit_key, "tombstones", body)}))
 
@@ -225,8 +239,9 @@ class Authority:
             result.append(checkpoint)
         return result
 
-    def _check_state(self, db, *, full=False):
-        anchor = json.loads((self.operator / "checkpoint.json").read_bytes())
+    def _check_state(self, db, *, full=False, anchor=None):
+        if anchor is None:
+            anchor = json.loads((self.operator / "checkpoint.json").read_bytes())
         if db.execute("SELECT cluster FROM meta").fetchone()[0] != self.trust["cluster"]:
             raise ValueError("authority cluster mismatch")
         head = self._head(db)
@@ -242,9 +257,24 @@ class Authority:
 
     def recover(self):
         with self.locked(), contextlib.closing(connect(self.path)) as db:
-            head = self._check_state(db, full=True)
+            anchor = json.loads((self.operator / "checkpoint.json").read_bytes())
+            verify(self.trust["audit_public"], "checkpoint", anchor["head"], anchor["signature"])
+            path = self.operator / "restore-intent.json"
+            intent = json.loads(path.read_bytes()) if path.exists() else None
+            if intent is not None:
+                verify(self.trust["audit_public"], "restore-intent", intent["body"], intent["signature"])
+                body = intent["body"]
+                target = body["checkpoint"]
+                verify(self.trust["audit_public"], "checkpoint", target["head"], target["signature"])
+                if anchor["head"] not in (body["previous"], target["head"]):
+                    raise ValueError("restore intent does not match retained checkpoint")
+                if self._head(db) == target["head"]:
+                    anchor = target
+            head = self._check_state(db, full=True, anchor=anchor)
             # A committed, valid tail may precede its checkpoint if the process crashed.
             self._checkpoint(db)
+            if intent is not None:
+                atomic_write(path, b"null")
             return head
 
     def _append(self, db, actor, device, action, node, outcome, details):
@@ -573,7 +603,7 @@ class Authority:
 
         A backup must match the latest checkpoint, or, with ``accept_rollback``, an earlier
         signed checkpoint from the operator's history. Revocations recorded after the backup
-        are re-applied from the operator's signed tombstones, so no device comes back.
+        are re-applied. A snapshot predating a committed rotation is never accepted.
         """
         try:
             with Path(source).open("rb") as stream:
@@ -586,9 +616,22 @@ class Authority:
             if public(restored_key) != self.trust["audit_public"]:
                 raise ValueError("backup signing key mismatch")
             with self.locked(), contextlib.closing(sqlite3.connect(":memory:")) as db:
+                if self.path.exists():
+                    try:
+                        with contextlib.closing(connect(self.path)) as live:
+                            self._check_state(live, full=True)
+                            self._sync_tombstones(live)
+                            # Preserve the old committed state if replacement is interrupted before rename.
+                            live.execute("PRAGMA journal_mode=DELETE")
+                    except (sqlite3.Error, ValueError, KeyError, TypeError, InvalidSignature):
+                        # A damaged authority can still be replaced by a verified backup.
+                        pass
                 db.row_factory = sqlite3.Row
                 db.deserialize(unb64(payload["database"]))
                 latest = json.loads((self.operator / "checkpoint.json").read_bytes())
+                verify(self.trust["audit_public"], "checkpoint", latest["head"], latest["signature"])
+                if latest["head"]["cluster"] != self.trust["cluster"]:
+                    raise ValueError("checkpoint cluster mismatch")
                 records = self._records(db)
                 head = verify_log(records, self.trust)
                 if db.execute("SELECT cluster FROM meta").fetchone()[0] != self.trust["cluster"]:
@@ -609,31 +652,45 @@ class Authority:
                     raise ValueError("backup state digest mismatch")
                 if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
                     raise ValueError("backup SQLite integrity failure")
+                tombstones = self._tombstones()
+                for device, minimum in tombstones["versions"].items():
+                    row = db.execute("SELECT version FROM devices WHERE id=?", (device,)).fetchone()
+                    if row is None or row["version"] < minimum:
+                        raise ValueError("backup predates a committed key rotation; use a newer backup")
+                self.audit_key = restored_key
+                reapplied = []
+                for device in tombstones["devices"]:
+                    if db.execute("SELECT 1 FROM devices WHERE id=? AND revoked=0", (device,)).fetchone():
+                        db.execute("UPDATE devices SET revoked=1 WHERE id=?", (device,))
+                        db.execute("UPDATE keys SET state='revoked' WHERE device=?", (device,))
+                        reapplied.append(device)
+                if rollback or reapplied:
+                    self._append(db, "operator", None, "restore", "authority", "allowed",
+                                 {"rollback": rollback, "reapplied_revocations": reapplied})
+                db.commit()
                 # WAL-free output makes atomic database replacement unambiguous.
                 db.execute("PRAGMA journal_mode=DELETE")
                 restored = db.serialize()
+                head = self._head(db)
+                checkpoint = {"head": head, "signature": sign(restored_key, "checkpoint", head)}
+                body = {"previous": latest["head"], "checkpoint": checkpoint}
+                atomic_write(self.directory / "audit.pem", private_bytes(restored_key))
+                atomic_write(self.operator / "restore-intent.json", canonical(
+                    {"body": body, "signature": sign(restored_key, "restore-intent", body)}))
+                if self.fault:
+                    self.fault("restore_prepared")
                 for suffix in ("-wal", "-shm"):
                     sidecar = Path(str(self.path) + suffix)
                     if sidecar.exists():
                         sidecar.unlink()
-                tombstones = self._tombstones()
                 atomic_write(self.path, restored)
-                atomic_write(self.directory / "audit.pem", private_bytes(restored_key))
-                self.audit_key = restored_key
-                reapplied = []
+                if self.fault:
+                    self.fault("restore_replaced")
                 with contextlib.closing(connect(self.path)) as live:
-                    live.execute("BEGIN IMMEDIATE")
-                    for device in tombstones:
-                        if live.execute("SELECT 1 FROM devices WHERE id=? AND revoked=0", (device,)).fetchone():
-                            live.execute("UPDATE devices SET revoked=1 WHERE id=?", (device,))
-                            live.execute("UPDATE keys SET state='revoked' WHERE device=?", (device,))
-                            reapplied.append(device)
-                    if rollback or reapplied:
-                        self._append(live, "operator", None, "restore", "authority", "allowed",
-                                     {"rollback": rollback, "reapplied_revocations": reapplied})
-                    live.commit()
                     self._checkpoint(live)
-                    head = self._head(live)
+                if self.fault:
+                    self.fault("restore_checkpointed")
+                atomic_write(self.operator / "restore-intent.json", b"null")
             return {"restored": True, "head": head, "rollback": rollback, "reapplied_revocations": reapplied}
         except (InvalidTag, InvalidSignature, ValueError, KeyError, TypeError, sqlite3.Error) as exc:
             raise ValueError("backup verification failed; no unverified key material used") from exc

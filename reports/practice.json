@@ -1,7 +1,7 @@
 {
   "alerts": [
     {
-      "alert_at": 1768467785.2,
+      "alert_at": 1768467840.1,
       "events": [
         "evt-008"
       ],
@@ -14,7 +14,7 @@
       "trigger": "evt-008"
     },
     {
-      "alert_at": 1768467786.2,
+      "alert_at": 1768467840.1,
       "events": [
         "evt-008",
         "evt-009"
@@ -29,7 +29,7 @@
       "trigger": "evt-009"
     },
     {
-      "alert_at": 1768467842.1,
+      "alert_at": 1768467902.2,
       "events": [
         "evt-010",
         "evt-011"
@@ -45,7 +45,7 @@
       "trigger": "evt-011"
     },
     {
-      "alert_at": 1768467843.1,
+      "alert_at": 1768467902.2,
       "events": [
         "evt-010",
         "evt-011",
@@ -71,7 +71,7 @@
     "false_alerts_per_1000_benign_events": 0.0,
     "false_negatives": 0,
     "false_positives": 0,
-    "median_time_to_alert_seconds": 0.20000004768371582,
+    "median_time_to_alert_seconds": 59.200000047683716,
     "per_event": [
       {
         "event_id": "evt-001",
@@ -237,7 +237,7 @@
     },
     {
       "event_id": "evt-013",
-      "explanation": "occurred before an event already received; receipt order kept",
+      "explanation": "source evidence keeps receipt order; correlation uses corrected event time",
       "notice": "out_of_order_arrival"
     },
     {
@@ -257,8 +257,10 @@
     }
   ],
   "timing": {
+    "max_clock_offset_seconds": 120,
     "max_corrected_delay_seconds": 30.0,
     "max_negative_skew_seconds": 1.0,
+    "offline_final_flush_seconds": 30.0,
     "review_window_seconds": 600,
     "sequence_window_seconds": 300
   }

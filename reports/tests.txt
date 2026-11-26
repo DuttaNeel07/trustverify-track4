@@ -1,4 +1,6 @@
-.........................................................s.....          [100%]
-=========================== short test summary info ============================
-SKIPPED [1] tests/test_practice.py:91: toolkit practice data not checked out
-62 passed, 1 skipped in 8.71s
+Local regression check: Python 3.12, existing cryptography 50.0.2 and pytest 9.2.0.
+Toolkit practice data included. Adapter tests excluded because pqcrypto 0.4.0 is not installed locally.
+Command: python -m pytest -q -p no:cacheprovider --basetemp=/scratch/tests --ignore=tests/test_adapter.py
+65 passed
+Three-process demo: passed.
+The PR adapter CI job separately checks the pinned pqcrypto-only runtime.
