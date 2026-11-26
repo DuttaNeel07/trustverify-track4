@@ -4,8 +4,8 @@ import heapq
 import math
 import statistics
 
-MAX_CLOCK_OFFSET = 120
-MAX_LATENESS = 30
+from .constants import MAX_CLOCK_OFFSET, MAX_LATENESS
+
 PATH_WINDOW = 60
 APPROVED_EDGES = {("frontend", "billing"), ("billing", "frontend")}
 

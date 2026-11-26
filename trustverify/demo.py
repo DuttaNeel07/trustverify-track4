@@ -214,6 +214,13 @@ def run(directory, fixture_path=None, progress=print):
             assert any(a["rule"] == "unapproved_privilege_grant" and a["identity"] == "carol" for a in detection["alerts"])
             assert any(a["rule"] == "unexpected_service_transition" and a["identity"] == "carol" for a in detection["alerts"])
             checks["verified_real_log_detection"] = True
+            from .watch import Watcher
+            live = Watcher(authority, approver, directory / "live-alerts.jsonl").poll()
+            contained = [a for a in live if a["rule"] == "unapproved_privilege_grant" and a["identity"] == "carol"]
+            assert contained and contained[0]["response"]["status"] == "applied"
+            expect_denied(lambda: Client(remotes["node-c"], carol, authority.trust).call("access"), "permission")
+            checks["live_detection_contained_unapproved_grant"] = True
+            performance["live_detection_latency_seconds"] = max(a["detection_latency_seconds"] for a in contained)
             atomic_write(directory / "audit-export.json", canonical(exported))
             atomic_write(directory / "alerts.json", canonical(detection))
 

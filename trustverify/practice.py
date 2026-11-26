@@ -15,8 +15,14 @@ Timing
 - Corrected event time = source time minus the stated source clock offset.
 - Arrival order is kept as received. An event whose corrected time precedes one already
   received produces an ``out_of_order_arrival`` notice; a nonzero offset produces a
-  ``clock_offset_corrected`` notice; corrected collector delay outside
-  [-``MAX_SKEW``, ``MAX_DELAY``] marks the order as uncertain.
+  ``clock_offset_corrected`` notice. The supported range is shared with the main detector
+  (``trustverify.constants``): offsets up to 120 s and corrected delay in [-1 s, 30 s].
+  Outside it, or when two events of one session share a corrected timestamp across
+  different services, the order is flagged as uncertain and no sequence alert is built on it.
+Baseline
+- An edge is expected if the role policy lists it, or if it has already been observed as
+  allowed for that role by at least ``BASELINE_MIN_IDENTITIES`` distinct identities. Roles
+  missing from the policy therefore start strict and relax only on observed benign use.
 """
 
 import csv
@@ -25,10 +31,11 @@ import statistics
 from datetime import datetime
 from pathlib import Path
 
+from .constants import MAX_CLOCK_OFFSET, MAX_LATENESS, MAX_NEGATIVE_SKEW
+
 REVIEW_WINDOW = 600
 SEQUENCE_WINDOW = 300
-MAX_DELAY = 30.0
-MAX_SKEW = 1.0
+BASELINE_MIN_IDENTITIES = 2
 POST_REVOCATION_WINDOW = 3600
 POSITIVE_LABELS = {"unexpected_role_change", "review_after_role_change", "lateral_movement_candidate"}
 DEFAULT_POLICY = Path(__file__).resolve().parent / "service_policy.json"
@@ -63,8 +70,10 @@ def load_policy(path=DEFAULT_POLICY):
     return {role: {tuple(edge) for edge in edges} for role, edges in raw["role_edges"].items()}
 
 
-def analyze(events, approvals, policy):
+def analyze(events, approvals, policy, learn=True):
     alerts, notices = [], []
+    learned = {}                # (role, edge) -> identities observed using it successfully
+    last_seen = {}              # session -> (corrected time, target service)
     approved_seen = {}          # approval_id -> (approver, corrected time) once received
     flagged_sessions = {}       # session -> (role-change event, corrected time)
     unexpected = {}             # (session, correlation) -> [events]
@@ -102,9 +111,18 @@ def analyze(events, approvals, policy):
         if event["offset_seconds"]:
             notices.append({"event_id": event["event_id"], "notice": "clock_offset_corrected",
                             "offset_seconds": event["offset_seconds"], "corrected_delay_seconds": round(delay, 3)})
-        if not -MAX_SKEW <= delay <= MAX_DELAY:
+        uncertain = False
+        if abs(event["offset_seconds"]) > MAX_CLOCK_OFFSET or not -MAX_NEGATIVE_SKEW <= delay <= MAX_LATENESS:
+            uncertain = True
             notices.append({"event_id": event["event_id"], "notice": "event_order_uncertain",
+                            "reason": "outside supported clock/arrival range",
                             "corrected_delay_seconds": round(delay, 3)})
+        previous = last_seen.get(event["session_id"])
+        if previous and previous[0] == at and previous[1] != event["target_service"]:
+            uncertain = True
+            notices.append({"event_id": event["event_id"], "notice": "event_order_uncertain",
+                            "reason": "equal corrected timestamps in one session; service order unknown"})
+        last_seen[event["session_id"]] = (at, event["target_service"])
         if latest_corrected is not None and at < latest_corrected:
             notices.append({"event_id": event["event_id"], "notice": "out_of_order_arrival",
                             "explanation": "occurred before an event already received; receipt order kept"})
@@ -132,7 +150,14 @@ def analyze(events, approvals, policy):
                   [event["source_service"], event["target_service"]])
             continue
         edge = (event["source_service"], event["target_service"])
-        if edge in policy.get(event["role_before"], set()) or scope_allows(event, at) or denied_after_revocation(event, at):
+        role = event["role_before"]
+        observed = learned.setdefault((role, edge), set())
+        baseline = learn and len(observed) >= BASELINE_MIN_IDENTITIES
+        if success:
+            observed.add(event["actor"])
+        if edge in policy.get(role, set()) or baseline or scope_allows(event, at) or denied_after_revocation(event, at):
+            continue
+        if uncertain:
             continue
         key = (event["session_id"], event["correlation_id"])
         group = [e for e in unexpected.get(key, []) if at - e["corrected_at"] <= SEQUENCE_WINDOW]
@@ -149,7 +174,8 @@ def analyze(events, approvals, policy):
               f"{' -> '.join(path)} (outcomes: {', '.join(outcomes)}). Candidate only; denials do not show access.",
               path)
     return {"alerts": alerts, "notices": notices,
-            "timing": {"max_corrected_delay_seconds": MAX_DELAY, "max_negative_skew_seconds": MAX_SKEW,
+            "timing": {"max_clock_offset_seconds": MAX_CLOCK_OFFSET, "max_corrected_delay_seconds": MAX_LATENESS,
+                       "max_negative_skew_seconds": MAX_NEGATIVE_SKEW,
                        "sequence_window_seconds": SEQUENCE_WINDOW, "review_window_seconds": REVIEW_WINDOW}}
 
 
@@ -179,10 +205,13 @@ def score(events, result, labels_path):
             "per_event": rows}
 
 
-def run(directory, policy_path=DEFAULT_POLICY):
+def run(directory, policy_path=DEFAULT_POLICY, use_policy=True):
+    """``use_policy=False`` runs on the learned baseline alone, as for logs from unknown services."""
     directory = Path(directory)
     events = load_events(directory / "events.csv")
-    result = analyze(events, load_approvals(directory / "approvals.json"), load_policy(policy_path))
+    policy = load_policy(policy_path) if use_policy else {}
+    result = analyze(events, load_approvals(directory / "approvals.json"), policy)
+    result["policy"] = "configured + learned baseline" if use_policy else "learned baseline only"
     if (directory / "labels.csv").exists():
         result["evaluation"] = score(events, result, directory / "labels.csv")
     return result

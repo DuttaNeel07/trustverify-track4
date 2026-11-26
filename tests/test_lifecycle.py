@@ -324,3 +324,28 @@ def test_directory_lookup_requires_authentication(sandbox):
             "action": "directory", "data": {"device": bob.device}, "signature": "AA=="}
     with pytest.raises(Denied):
         authority.execute("node-a", junk)
+
+
+def test_live_watch_detects_and_contains_an_unapproved_grant(sandbox, tmp_path):
+    from trustverify.watch import Watcher
+    authority, operator, _, _ = sandbox
+    carol = Identity.generate("carol-device")
+    operator.call("enroll", **carol.enrollment("carol"))
+    approval = operator.officer.call("approve", owner="carol", service="frontend")["approval"]
+    operator.call("grant", owner="carol", service="frontend", approval=approval)
+    watcher = Watcher(authority, operator.officer, tmp_path / "alerts.jsonl")
+    assert watcher.poll() == []
+    operator.call("grant", owner="carol", service="secrets")
+    assert client(authority, carol, "node-c").call("access")["actor"] == "carol"
+    alerts = watcher.poll()
+    grant = [a for a in alerts if a["rule"] == "unapproved_privilege_grant"]
+    assert grant and grant[0]["identity"] == "carol"
+    assert grant[0]["response"]["status"] == "applied" and grant[0]["detection_latency_seconds"] >= 0
+    with pytest.raises(Denied, match="permission"):
+        client(authority, carol, "node-c").call("access")
+    assert client(authority, carol, "node-a").call("access")["actor"] == "carol"
+    assert watcher.poll() == []  # alerts are not repeated
+    lines = (tmp_path / "alerts.jsonl").read_text().splitlines()
+    assert len(lines) == len(alerts)
+    removal = [r["body"] for r in authority.export_log()["records"] if r["body"]["action"] == "remove_permission"]
+    assert removal[-1]["actor"] == "security-officer"

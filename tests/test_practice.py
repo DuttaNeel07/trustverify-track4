@@ -94,3 +94,30 @@ def test_toolkit_practice_events_match_published_labels():
     mismatches = [r for r in evaluation["per_event"]
                   if r["flagged"] != (r["label"] in evaluation["positive_labels"])]
     assert mismatches == []
+
+
+def test_learned_baseline_accepts_edges_used_by_several_identities(tmp_path):
+    rows = [row(f"g{i}", i, f"user-{i}", "portal", "wiki", "read", "editor", "editor", "allow",
+                session=f"s{i}", flow=f"f{i}") for i in range(1, 4)]
+    rows += [row("g8", 8, "user-9", "portal", "wiki", "read", "editor", "editor", "allow", session="s9", flow="f9"),
+             row("g9", 9, "user-9", "wiki", "vault", "read", "editor", "editor", "allow", session="s9", flow="f9")]
+    result = write(tmp_path / "d", rows, [])
+    # portal -> wiki was seen for two identities before g8, so only the new wiki -> vault edge is unexpected.
+    assert result["alerts"] == []
+    assert {n["event_id"] for n in result["notices"] if n["notice"] == "isolated_unexpected_edge"} >= {"g9"}
+
+
+def test_equal_timestamps_across_services_are_flagged_and_not_sequenced(tmp_path):
+    result = write(tmp_path / "d", [
+        row("h1", 5, "svc", "reports", "billing", "read", "service-reader", "service-reader", "allow"),
+        row("h2", 5, "svc", "billing", "archive", "read", "service-reader", "service-reader", "allow")], [])
+    assert ("h2", "event_order_uncertain") in {(n["event_id"], n["notice"]) for n in result["notices"]}
+    assert result["alerts"] == []
+
+
+def test_offset_beyond_supported_range_is_uncertain(tmp_path):
+    result = write(tmp_path / "d", [
+        row("k1", 5, "eve", "portal", "catalog", "read", "viewer", "viewer", "allow", offset=121000,
+            received="2026-01-15T08:58:04.500Z")], [])
+    assert [n["reason"] for n in result["notices"] if n["notice"] == "event_order_uncertain"] == [
+        "outside supported clock/arrival range"]

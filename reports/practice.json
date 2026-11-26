@@ -256,8 +256,10 @@
       "notice": "isolated_unexpected_edge"
     }
   ],
+  "policy": "configured + learned baseline",
   "timing": {
-    "max_corrected_delay_seconds": 30.0,
+    "max_clock_offset_seconds": 120,
+    "max_corrected_delay_seconds": 30,
     "max_negative_skew_seconds": 1.0,
     "review_window_seconds": 600,
     "sequence_window_seconds": 300
