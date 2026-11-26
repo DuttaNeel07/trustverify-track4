@@ -6,6 +6,17 @@ from scripts.make_fixture import make_events, make_heldout_events
 from trustverify.detector import analyze, evaluate
 
 
+@pytest.mark.parametrize("delay,expected", [(-1.0, True), (-0.5, True), (0.0, True), (-1.1, False)])
+def test_shared_negative_delay_contract(delay, expected):
+    events = [{"id": str(i), "actor": "alice", "action": "access", "service": service,
+               "outcome": "allowed", "details": {}, "source_at": 100 + i,
+               "observed_at": 100 + i + delay, "clock_offset": 0, "clock_offset_trusted": True}
+              for i, service in enumerate(("frontend", "secrets"))]
+    result = analyze(events)
+    assert bool(result["alerts"]) is expected
+    assert bool(result["timing_notices"]) is not expected
+
+
 @pytest.mark.parametrize("seed", [2026, 41, 987])
 def test_labelled_metrics_and_approved_context(seed):
     events = make_events(seed)

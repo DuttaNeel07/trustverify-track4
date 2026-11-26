@@ -80,6 +80,7 @@ class Store:
         self.audit_path = self.directory / "adapter-audit.jsonl"
         # The signing key lives in its own 0700 directory, apart from the state it signs.
         self.key_path = self.directory / "keys" / "adapter-audit.key"
+        self.public_path = self.key_path.with_suffix(".pub")
 
     @contextlib.contextmanager
     def locked(self):
@@ -97,6 +98,21 @@ class Store:
         state = json.loads(self.path.read_bytes())
         if state.get("format") != FORMAT:
             raise RequestError("unsupported state format")
+        public_key = unb64(state["audit_public"])
+        if not self.public_path.exists():
+            # Upgrade older state only after proving the public key matches the protected private key.
+            probe = DOMAIN + b"key-binding\x00" + os.urandom(32)
+            if not ml_dsa_65.verify(public_key, probe, ml_dsa_65.sign(self.signing_key(), probe)):
+                raise RequestError("audit key does not match the protected signing key")
+            atomic_write(self.public_path, public_key)
+        if not hmac.compare_digest(public_key, self.public_path.read_bytes()):
+            raise RequestError("audit key does not match the protected public key")
+        setup = state["setup_record"]
+        body = setup["body"]
+        if (body["seq"] != 1 or body["previous"] != ZERO or body["instance"] != state["instance"]
+                or body["op"] != "setup" or not ml_dsa_65.verify(
+                    public_key, DOMAIN + canonical(body), unb64(setup["signature"]))):
+            raise RequestError("setup signature verification failed")
         size = self.audit_path.stat().st_size if self.audit_path.exists() else 0
         if size < state["audit_bytes"]:
             raise RequestError("audit log shorter than committed state; integrity failure")
@@ -220,6 +236,7 @@ def setup(store, request):
     # key_material is synthetic and sensitive: it is accepted but never stored or echoed.
     public_key, secret_key = ml_dsa_65.generate_keypair()
     atomic_write(store.key_path, secret_key)
+    atomic_write(store.public_path, public_key)
     state = {"format": FORMAT, "instance": uuid.uuid4().hex, "audit_public": b64(public_key),
              "owners": owners, "contents": contents, "disabled": sorted(set(disabled)),
              "revoked": [], "decisions": {}, "seq": 0, "head": ZERO, "audit_bytes": 0}

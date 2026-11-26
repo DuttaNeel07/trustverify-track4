@@ -166,12 +166,11 @@ def test_pinned_fingerprint_detects_a_resigned_log(state):
         if body.get("request_id") == "r60":
             body["decision"] = "deny"
     _resign_with_new_key(state, flip)
-    assert call(state, op="audit", request_id="r60")[1]["decision"] == "deny"
-    # Without the pin the rewritten log is only internally consistent...
-    assert call(state, op="verify_audit")[1]["anchored"] is False
-    # ...with the pinned fingerprint it is rejected.
+    # The protected public key rejects substitution even before an operator supplies a pin.
+    assert call(state, op="audit", request_id="r60")[0] == 1
+    assert call(state, op="verify_audit")[0] == 1
     code, reply = call(state, op="verify_audit", audit_key_sha256=pinned)
-    assert code == 1 and "fingerprint" in reply["error"]
+    assert code == 1 and "protected public key" in reply["error"]
 
 
 def test_pinned_checkpoint_detects_rewritten_or_truncated_history(state):
@@ -194,6 +193,32 @@ def test_tampered_body_is_never_served(state):
     public_key, _ = ml_kem_768.generate_keypair()
     assert call(state, op="protected_read", actor="maya", asset="brief", challenge="c",
                 public_key=base64.b64encode(public_key).decode())[1] == {"decision": "deny"}
+
+
+def test_modified_body_and_cached_hash_are_rejected_before_read(state):
+    path = state / "adapter-state.json"
+    document = json.loads(path.read_bytes())
+    document["contents"]["brief"] = "attacker text"
+    document["setup_record"]["body"]["contents_sha256"]["brief"] = hashlib.sha256(b"attacker text").hexdigest()
+    path.write_text(json.dumps(document))
+    public_key, _ = ml_kem_768.generate_keypair()
+    for request in [dict(op="read", actor="maya", asset="brief", request_id="changed-hash"),
+                    dict(op="protected_read", actor="maya", asset="brief", challenge="c",
+                         public_key=base64.b64encode(public_key).decode())]:
+        code, reply = call(state, **request)
+        assert code == 1 and "setup signature" in reply["error"] and "body" not in reply
+
+
+def test_legacy_adapter_public_key_is_bound_to_protected_private_key(state):
+    public = state / "keys" / "adapter-audit.pub"
+    public.unlink()
+    assert call(state, op="read", actor="maya", asset="brief", request_id="upgrade")[1]["body"] == "demo note"
+    assert public.exists()
+    public.unlink()
+    _resign_with_new_key(state, lambda body: None)
+    code, reply = call(state, op="read", actor="maya", asset="brief", request_id="forged-upgrade")
+    assert code == 1 and "protected signing key" in reply["error"]
+    assert not public.exists()
 
 
 def test_crashed_unacknowledged_tail_is_dropped_and_log_stays_valid(state):

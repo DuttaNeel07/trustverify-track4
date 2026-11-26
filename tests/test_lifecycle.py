@@ -298,14 +298,82 @@ def test_backup_from_unknown_history_is_rejected(sandbox, tmp_path):
 
 def test_challenge_flood_cannot_lock_out_enrolled_devices(sandbox):
     authority, operator, alice, bob = sandbox
-    for _ in range(authority.ANONYMOUS_CHALLENGES * 3):
-        authority.challenge("node-a")
-    for _ in range(authority.CHALLENGES_PER_DEVICE * 3):
-        authority.challenge("node-a", "nobody-device")
-    assert client(authority, alice).call("access")["actor"] == "alice"
-    assert operator.call("access")["actor"] == "operator"
+    alice_client = client(authority, alice)
+    pending_alice, pending_admin = alice_client.envelope("access", {}), operator.envelope("access", {})
     with contextlib.closing(connect(authority.path)) as db:
-        assert db.execute("SELECT COUNT(*) FROM nonces").fetchone()[0] <= authority.ANONYMOUS_CHALLENGES
+        before = db.execute("SELECT COUNT(*) FROM nonces").fetchone()[0]
+    for device in (None, "nobody-device", alice.device, operator.identity.device):
+        for _ in range(32):
+            authority.challenge("node-a", device)
+    with contextlib.closing(connect(authority.path)) as db:
+        assert db.execute("SELECT COUNT(*) FROM nonces").fetchone()[0] == before
+    assert alice_client.api.request(pending_alice)["actor"] == "alice"
+    assert operator.api.request(pending_admin)["actor"] == "operator"
+
+
+def legacy_nonces(authority):
+    with authority.locked(), contextlib.closing(connect(authority.path)) as db, db:
+        db.execute("DROP TABLE nonces")
+        db.execute("CREATE TABLE nonces (nonce TEXT PRIMARY KEY, node TEXT NOT NULL, expires REAL NOT NULL)")
+    (authority.operator / "challenge-epoch").unlink()
+
+
+def test_existing_authority_migrates_without_changing_committed_state(sandbox):
+    authority, _, alice, bob = sandbox
+    legacy_nonces(authority)
+    before = authority.export_log()["checkpoint"]
+    upgraded = Authority(authority.directory, authority.operator)
+    upgraded.recover()
+    assert upgraded.export_log()["checkpoint"] == before
+    for node in NODES:
+        assert client(upgraded, alice, node).call("access")["actor"] == "alice"
+        assert client(upgraded, bob, node).call("access")["actor"] == "bob"
+
+
+def test_legacy_backup_migrates_and_remains_usable(sandbox, tmp_path):
+    authority, _, alice, _ = sandbox
+    legacy_nonces(authority)
+    backup = tmp_path / "legacy.backup"
+    authority.backup(backup)
+    recovery = Authority(authority.directory, authority.operator, recovery_only=True)
+    assert recovery.restore(backup)["restored"]
+    recovery.recover()
+    for node in NODES:
+        assert client(recovery, alice, node).call("access")["actor"] == "alice"
+
+
+def test_stateless_challenge_replay_stays_rejected_after_restart_and_restore(sandbox, tmp_path):
+    authority, _, alice, _ = sandbox
+    alice_client = client(authority, alice)
+    request = alice_client.envelope("access", {})
+    backup = tmp_path / "before-request.backup"
+    authority.backup(backup)
+    alice_client.api.request(request)
+    restarted = Authority(authority.directory, authority.operator)
+    restarted.recover()
+    with pytest.raises(Denied, match="replayed"):
+        restarted.execute("node-a", request)
+    restarted.restore(backup, accept_rollback=True)
+    with pytest.raises(Denied, match="replayed"):
+        restarted.execute("node-a", request)
+    assert client(restarted, alice).call("access")["actor"] == "alice"
+
+
+def test_stateless_challenge_signature_and_expiry_are_enforced(sandbox):
+    from trustverify.crypto import b64, canonical, unb64
+    authority, _, alice, _ = sandbox
+    caller = client(authority, alice)
+    request = caller.envelope("access", {})
+    token = json.loads(unb64(request["nonce"]))
+    token["claim"]["expires"] += 300
+    request["nonce"] = b64(canonical(token))
+    request["signature"] = sign(alice.key, "request", {k: v for k, v in request.items() if k != "signature"})
+    with pytest.raises(Denied, match="expired"):
+        authority.execute("node-a", request)
+    expired = caller.envelope("access", {})
+    authority.now = lambda: time.time() + 31
+    with pytest.raises(Denied, match="expired"):
+        authority.execute("node-a", expired)
 
 
 def test_device_bound_challenge_cannot_be_used_by_another_device(sandbox):

@@ -98,3 +98,14 @@ def test_directory_is_not_an_anonymous_http_endpoint(sandbox):
             urlopen(remotes["node-a"].url + "/directory/" + bob.device, timeout=5)
         assert failed.value.code == 404
         assert Client(remotes["node-a"], alice, authority.trust).directory(bob.device)["owner"] == "bob"
+
+
+def test_anonymous_client_naming_admin_cannot_evict_its_pending_challenge(sandbox):
+    authority, operator, _, _ = sandbox
+    with nodes(authority) as remotes:
+        admin = Client(remotes["node-a"], operator.identity, authority.trust)
+        pending = admin.envelope("access", {})
+        for _ in range(20):
+            with urlopen(remotes["node-a"].url + "/challenge?device=operator-device", timeout=5) as reply:
+                assert reply.status == 200
+        assert admin.api.request(pending)["actor"] == "operator"
