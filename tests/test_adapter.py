@@ -22,6 +22,15 @@ def read_log(state):
     return [json.loads(line) for line in (state / "adapter-audit.jsonl").read_bytes().splitlines()]
 
 
+def write_state(state, document):
+    """Attacker who can also read the key directory: write the state and re-tag it."""
+    from trustverify.encoding import canonical
+    document = {k: v for k, v in document.items() if k != "mac"}
+    key = (state / "keys" / "adapter-state.key").read_bytes()
+    document["mac"] = hmac.new(key, canonical(document), hashlib.sha256).hexdigest()
+    (state / "adapter-state.json").write_text(json.dumps(document))
+
+
 def write_log(state, records, **changes):
     """Attacker with write access: replace the log and make the state document agree with it."""
     from trustverify.adapter import _record_hash
@@ -31,7 +40,7 @@ def write_log(state, records, **changes):
     document = json.loads((state / "adapter-state.json").read_bytes())
     document.update(audit_bytes=len(data), seq=len(records), head=_record_hash(records[-1]),
                     setup_record=records[0], **changes)
-    (state / "adapter-state.json").write_text(json.dumps(document))
+    write_state(state, document)
 
 
 def call(state, **request):
@@ -108,7 +117,7 @@ def test_audit_log_is_signed_and_tamper_evident(state):
     records[-1]["body"]["decision"] = "deny"
     write_log(state, records)
     code, reply = call(state, op="verify_audit")
-    assert code == 1 and "error" in reply
+    assert code == 0 and "error" in reply and "verified" not in reply
 
 
 def test_user_text_cannot_forge_a_second_event(state):
@@ -118,8 +127,9 @@ def test_user_text_cannot_forge_a_second_event(state):
     call(state, op="read", actor=quoted, asset="plan", request_id="r30")
     call(state, op="read", actor=multiline, asset="plan", request_id="r31")
     records = read_log(state)
-    first, second = (record["body"] for record in records[before:])
-    assert len(records) == before + 2
+    events = [record["body"] for record in records[before:] if record["body"]["op"] == "read"]
+    first, second = events
+    assert len(events) == 2
     assert (first["actor"], first["decision"]) == (quoted, "deny")
     # Control characters are rejected outright, so no actor is recorded for that request.
     assert (second["actor"], second["decision"], second["reason"]) == (None, "deny", "malformed request")
@@ -129,7 +139,7 @@ def test_user_text_cannot_forge_a_second_event(state):
 def test_malformed_requests_fail_closed(state, tmp_path_factory):
     assert call(state, op="read", actor=["maya"], asset="brief", request_id="r40")[1] == {"decision": "deny"}
     code, reply = call(state, op="nope")
-    assert code == 1 and reply == {"error": "unknown op"}
+    assert code == 0 and reply == {"decision": "deny", "error": "unknown op"}
     empty = tmp_path_factory.mktemp("empty")
     assert call(empty, op="read", actor="maya", asset="brief", request_id="r1")[1] == {"decision": "deny"}
 
@@ -167,10 +177,10 @@ def test_pinned_fingerprint_detects_a_resigned_log(state):
             body["decision"] = "deny"
     _resign_with_new_key(state, flip)
     # The protected public key rejects substitution even before an operator supplies a pin.
-    assert call(state, op="audit", request_id="r60")[0] == 1
-    assert call(state, op="verify_audit")[0] == 1
+    assert "error" in call(state, op="audit", request_id="r60")[1]
+    assert "error" in call(state, op="verify_audit")[1]
     code, reply = call(state, op="verify_audit", audit_key_sha256=pinned)
-    assert code == 1 and "protected public key" in reply["error"]
+    assert code == 0 and "protected public key" in reply["error"]
 
 
 def test_pinned_checkpoint_detects_rewritten_or_truncated_history(state):
@@ -181,7 +191,7 @@ def test_pinned_checkpoint_detects_rewritten_or_truncated_history(state):
     assert call(state, op="verify_audit", checkpoint=pin)[1]["verified"] is True
     write_log(state, read_log(state)[:1])
     code, reply = call(state, op="verify_audit", checkpoint=pin)
-    assert code == 1
+    assert code == 0 and "error" in reply
 
 
 def test_tampered_body_is_never_served(state):
@@ -189,6 +199,11 @@ def test_tampered_body_is_never_served(state):
     document = json.loads(path.read_bytes())
     document["contents"]["brief"] = "attacker text"
     path.write_text(json.dumps(document))
+    # Untagged edit: the state tag fails and every read fails closed.
+    reply = call(state, op="read", actor="maya", asset="brief", request_id="r79")[1]
+    assert reply["decision"] == "deny" and "body" not in reply
+    # Re-tagged edit (attacker also holds the key directory): the signed content hash still fails.
+    write_state(state, document)
     assert call(state, op="read", actor="maya", asset="brief", request_id="r80")[1] == {"decision": "deny"}
     public_key, _ = ml_kem_768.generate_keypair()
     assert call(state, op="protected_read", actor="maya", asset="brief", challenge="c",
@@ -200,13 +215,13 @@ def test_modified_body_and_cached_hash_are_rejected_before_read(state):
     document = json.loads(path.read_bytes())
     document["contents"]["brief"] = "attacker text"
     document["setup_record"]["body"]["contents_sha256"]["brief"] = hashlib.sha256(b"attacker text").hexdigest()
-    path.write_text(json.dumps(document))
+    write_state(state, document)
     public_key, _ = ml_kem_768.generate_keypair()
     for request in [dict(op="read", actor="maya", asset="brief", request_id="changed-hash"),
                     dict(op="protected_read", actor="maya", asset="brief", challenge="c",
                          public_key=base64.b64encode(public_key).decode())]:
         code, reply = call(state, **request)
-        assert code == 1 and "setup signature" in reply["error"] and "body" not in reply
+        assert code == 0 and "setup signature" in reply["error"] and "body" not in reply
 
 
 def test_legacy_adapter_public_key_is_bound_to_protected_private_key(state):
@@ -217,7 +232,7 @@ def test_legacy_adapter_public_key_is_bound_to_protected_private_key(state):
     public.unlink()
     _resign_with_new_key(state, lambda body: None)
     code, reply = call(state, op="read", actor="maya", asset="brief", request_id="forged-upgrade")
-    assert code == 1 and "protected signing key" in reply["error"]
+    assert code == 0 and "protected signing key" in reply["error"]
     assert not public.exists()
 
 
@@ -236,3 +251,45 @@ def test_state_document_stays_small_as_the_log_grows(state):
     # Only the request_id -> decision index grows (tens of bytes per request), not the signatures.
     assert (state / "adapter-state.json").stat().st_size - before < 40 * 64
     assert (state / "adapter-audit.jsonl").stat().st_size > 40 * 4000
+
+
+def test_probing_raises_signed_alerts(state):
+    call(state, op="read", actor="maya", asset="plan", request_id="r100")
+    call(state, op="read", actor="maya", asset="brief", request_id="r101")
+    call(state, op="read", actor="maya", asset="brief", request_id="r101")
+    call(state, op="revoke", actor="maya")
+    call(state, op="read", actor="maya", asset="brief", request_id="r102")
+    reply = call(state, op="alerts")[1]
+    rules = [a["rule"] for a in reply["alerts"]]
+    assert rules == ["cross_owner_access", "request_id_replay", "revoked_actor_access"]
+    assert call(state, op="audit", request_id="r101")[1]["decision"] == "allow"
+    events = [r["body"] for r in read_log(state) if r["body"]["op"] == "alert"]
+    assert [e["rule"] for e in events] == rules and call(state, op="verify_audit")[1]["verified"] is True
+
+
+def test_protected_read_request_id_is_audited(state):
+    public_key, _ = ml_kem_768.generate_keypair()
+    key = base64.b64encode(public_key).decode()
+    assert call(state, op="protected_read", actor="maya", asset="brief", challenge="c", public_key=key,
+                request_id="p1")[1]["decision"] == "allow"
+    assert call(state, op="audit", request_id="p1")[1] == {"request_id": "p1", "decision": "allow", "recorded": True}
+
+
+def test_every_request_exits_zero_with_one_json_object(state):
+    env = {**os.environ, "TRACK4_STATE_DIR": str(state)}
+    for payload in (b"", b"not json", b"[]", b'{"op":"read"}', b'{"op":"read","x":NaN}', b"\xff"):
+        done = subprocess.run([sys.executable, "-B", str(ENTRY)], input=payload, capture_output=True,
+                              cwd=ROOT, env=env, timeout=20)
+        reply = json.loads(done.stdout)
+        assert done.returncode == 0 and reply["decision"] == "deny" and "body" not in reply
+
+
+def test_planted_shared_temp_directory_is_refused(tmp_path):
+    env = {k: v for k, v in os.environ.items() if k != "TRACK4_STATE_DIR"}
+    env["TMPDIR"] = str(tmp_path)
+    planted = tmp_path / "trustverify-track4"
+    planted.mkdir()
+    planted.chmod(0o777)
+    done = subprocess.run([sys.executable, "-B", str(ENTRY)], capture_output=True, cwd=ROOT, env=env, timeout=20,
+                          input=json.dumps({"op": "setup", "owners": {}, "contents": {}, "disabled": []}).encode())
+    assert json.loads(done.stdout)["ready"] is False and not any(planted.iterdir())
